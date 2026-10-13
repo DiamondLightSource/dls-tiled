@@ -725,6 +725,42 @@ def test_place_on_grid_without_points_is_the_bare_grid():
     assert placed is not None and placed[2] is None
 
 
+@pytest.mark.parametrize(
+    "motors",
+    [["sample_stage-y", "sample_stage-x"], ["sample_stage-x", "sample_stage-y"]],
+)
+def test_binned_lets_the_points_decide_x_and_y_when_only_the_motors_list_names_them(
+    client, motors
+):
+    # older runs store the axes as object reprs, and some list their motors in
+    # another order than the spec's axes: here y is the outer axis either way
+    spec = Line("<Motor object at 0x1>", 0, 4, 3) * Line(
+        "<Motor object at 0x2>", 0, 2, 3
+    )
+    write_points(
+        client,
+        "unnamed",
+        [0.0, 1.0, 2.0] * 3,
+        numpy.repeat([0.0, 2.0, 4.0], 3),
+        metadata={"start": {"spec": spec.serialize(), "motors": motors}},
+    )
+
+    body = client.context.http_client.get("/api/v1/binned/unnamed").json()
+
+    assert body["x_limits"] == [-0.5, 0.5, 1.5, 2.5]
+    assert body["y_limits"] == [-1.0, 1.0, 3.0, 5.0]
+    assert body["RedTotal"] == [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [6.0, 7.0, 8.0]]
+
+
+def test_place_on_grid_keeps_the_specs_own_names_over_a_better_fit():
+    grid = raster(5)
+
+    # positions that would fit the grid only with x and y swapped
+    placed = visr.place_on_grid(grid.y_setpoints, grid.x_setpoints, grid)
+
+    assert placed is None
+
+
 def test_binned_slice_dim_keeps_the_grid_of_an_offset_scan(client):
     # z innermost: a slice in z leaves every other point, which must still be
     # paired with its own setpoint to find the offset

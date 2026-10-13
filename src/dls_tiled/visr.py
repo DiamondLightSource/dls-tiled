@@ -247,14 +247,28 @@ MIN_CELLS_PER_AXIS = 3
 
 
 class ScanGrid(NamedTuple):
-    """A scan's setpoint grid: bin edges on x and y, the point count, and each
-    point's x and y setpoint in scan order."""
+    """A scan's setpoint grid: bin edges on x and y, the point count, each
+    point's x and y setpoint in scan order, and whether the spec itself named
+    its axes (rather than the run's ``motors`` list, whose order isn't reliable:
+    see ``place_on_grid``)."""
 
     x_edges: numpy.ndarray
     y_edges: numpy.ndarray
     n_total: int
     x_setpoints: numpy.ndarray
     y_setpoints: numpy.ndarray
+    named: bool = True
+
+    def transposed(self) -> "ScanGrid":
+        """The same grid with x and y swapped."""
+        return ScanGrid(
+            self.y_edges,
+            self.x_edges,
+            self.n_total,
+            self.y_setpoints,
+            self.x_setpoints,
+            self.named,
+        )
 
 
 # A grid keeps every point's x and y setpoint, so a scan of a million points
@@ -285,7 +299,10 @@ def _grid_from_spec(spec_json: str, motors_json: str) -> ScanGrid | None:
         return None  # a line, or too few cells for the plot's axes
     if len(xs) * len(ys) > min(n_total, MAX_GRID_CELLS):
         return None  # more cells than points: not a grid
-    return ScanGrid(_bin_edges(xs), _bin_edges(ys), n_total, x_setpoints, y_setpoints)
+    named = None not in (_axis_name(a) for a in axes)
+    return ScanGrid(
+        _bin_edges(xs), _bin_edges(ys), n_total, x_setpoints, y_setpoints, named
+    )
 
 
 # The grid is used when at least this share of the recorded points lie within
@@ -325,16 +342,56 @@ def place_on_grid(x, y, grid: ScanGrid, uid=""):
     accepted only once the scan is past its first row; before that, positions
     that need one don't fit yet.
 
-    Returns the positions and the offset ``(dx, dy)`` applied, or None for no
-    offset.
+    When the spec doesn't name its axes, which is x and which is y came from
+    the run's ``motors`` list, and older runs don't list it in the spec's axis
+    order (some list x first for a spec whose outer axis is y). Then the grid
+    with x and y swapped is tried as well, and the recorded points decide.
+
+    Returns the positions, the offset ``(dx, dy)`` applied (or None) and the
+    grid they were placed on.
     """
     x, y = numpy.asarray(x, dtype=float), numpy.asarray(y, dtype=float)
     if x.size == 0:
-        return x, y, None  # nothing received yet: the grid is all there is to show
+        # nothing received yet: the grid is all there is to show
+        return x, y, None, grid
+    best = None  # (fit, grid), the spec's own orientation first on a tie
+    for candidate in [grid] if grid.named else [grid, grid.transposed()]:
+        fit = _fit(x, y, candidate)
+        if fit is not None and (best is None or fit[:2] > best[0][:2]):
+            best = (fit, candidate)
+    if best is None or best[0][0] < MIN_POINTS_ON_SETPOINT:
+        logger.info(
+            "Recorded positions for '%s' don't lie on the spec's grid "
+            "(%.0f%% on their setpoint at best); keeping the default binning",
+            uid,
+            100 * (best[0][0] if best else 0.0),
+        )
+        return None
+    (_, _, dx, dy), chosen = best
+    if chosen is not grid:
+        logger.info(
+            "Recorded positions of '%s' follow its spec with x and y the other "
+            "way round from its motors list",
+            uid,
+        )
+    if dx == 0.0 and dy == 0.0:
+        return x, y, None, chosen
+    logger.info(
+        "Shifted the recorded positions of '%s' by (%s, %s) to match its spec",
+        uid,
+        dx,
+        dy,
+    )
+    return x - dx, y - dy, (dx, dy), chosen
+
+
+def _fit(x, y, grid: ScanGrid):
+    """How well positions fit a grid: ``(share on setpoint, by index, dx, dy)``
+    for the best pairing of points with setpoints, or None if none works."""
     cell_x = float(numpy.min(numpy.diff(grid.x_edges)))
     cell_y = float(numpy.min(numpy.diff(grid.y_edges)))
     offsets_known = len(x) > _first_row_length(grid)
-    best = None  # (share on setpoint, lag is 0, dx, dy)
+    best = None
     for lag in SETPOINT_LAGS:
         # recorded point i is setpoint i + lag
         recorded = numpy.arange(max(0, -lag), min(len(x), grid.n_total - lag))
@@ -355,24 +412,7 @@ def place_on_grid(x, y, grid: ScanGrid, uid=""):
         candidate = (float(on_setpoint.mean()), lag == 0, dx, dy)
         if best is None or candidate[:2] > best[:2]:
             best = candidate
-    if best is None or best[0] < MIN_POINTS_ON_SETPOINT:
-        logger.info(
-            "Recorded positions for '%s' don't lie on the spec's grid "
-            "(%.0f%% on their setpoint at best); keeping the default binning",
-            uid,
-            100 * (best[0] if best else 0.0),
-        )
-        return None
-    _, _, dx, dy = best
-    if dx == 0.0 and dy == 0.0:
-        return x, y, None
-    logger.info(
-        "Shifted the recorded positions of '%s' by (%s, %s) to match its spec",
-        uid,
-        dx,
-        dy,
-    )
-    return x - dx, y - dy, (dx, dy)
+    return best
 
 
 async def get_scan_grid(root, uid):
@@ -657,6 +697,7 @@ class ScanPoints(NamedTuple):
     n_points: int
     on_grid: bool
     offset: tuple[float, float] | None
+    grid: "ScanGrid | None"
 
 
 async def load_points(
@@ -797,7 +838,7 @@ async def load_points(
         placed = place_on_grid(readbacks[0], readbacks[1], grid, uid)
         if placed is not None:
             readbacks = readbacks.copy()
-            readbacks[0], readbacks[1], offset = placed
+            readbacks[0], readbacks[1], offset, grid = placed
             on_grid = True
 
     # mask out the points that lie outside the slice
@@ -850,6 +891,7 @@ async def load_points(
         int(readbacks.shape[-1]),
         on_grid,
         offset,
+        grid,
     )
 
 
@@ -884,14 +926,7 @@ async def _binned_output(
     grid = await get_scan_grid(root, uid)
     n_total = grid.n_total if grid is not None else None
     use_grid = grid is not None and not explicit_bins and not explicit_range
-    (
-        data,
-        x_positions,
-        y_positions,
-        n_points,
-        on_grid,
-        position_offset,
-    ) = await load_points(
+    points = await load_points(
         root,
         uid,
         x_dim_index,
@@ -900,9 +935,11 @@ async def _binned_output(
         slice_dim,
         grid if use_grid else None,
     )
-    if on_grid:
-        assert grid is not None
-        histogram2d_kwargs["bins"] = [grid.x_edges, grid.y_edges]
+    data, x_positions, y_positions = points.data, points.x, points.y
+    n_points, position_offset = points.n_points, points.offset
+    if points.on_grid:
+        assert points.grid is not None
+        histogram2d_kwargs["bins"] = [points.grid.x_edges, points.grid.y_edges]
 
     def bin_channels() -> dict:
         """The CPU-bound part, run off the event loop."""
@@ -1027,9 +1064,11 @@ async def render(  # type: ignore
     key = ("render", uid, tuple(sorted(request.query_params.multi_items())))
 
     async def compute():
-        grid = await get_scan_grid(root, uid)
-        points = await load_points(root, uid, 0, 1, setpoints, slice_dim, grid)
-        x, y, offset = points.x, points.y, points.offset
+        points = await load_points(
+            root, uid, 0, 1, setpoints, slice_dim, await get_scan_grid(root, uid)
+        )
+        # the grid the points were placed on, which may have x and y swapped
+        x, y, offset, grid = points.x, points.y, points.offset, points.grid
 
         step = _nominal_step(grid) if grid is not None else None
         if grid is not None:
