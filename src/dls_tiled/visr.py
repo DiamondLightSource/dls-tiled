@@ -646,12 +646,20 @@ async def _binned_output(
     # and retry re-fetching everything until they do. If they don't catch up
     # within the retry budget, fall back to truncating to whatever the shortest
     # currently is, so we always return a consistent (if possibly stale) image.
-    lengths = {
-        "RedTotal": _channel_length(red_total),
-        "GreenTotal": _channel_length(green_total),
-        "BlueTotal": _channel_length(blue_total),
-        "readbacks": readbacks.shape[-1],
-    }
+    # Setpoints come from the spec and are complete from the start, so they take
+    # no part in this: waiting for the data to reach them would only ever time
+    # out while a scan is running.
+    def current_lengths() -> dict[str, int]:
+        found = {
+            "RedTotal": _channel_length(red_total),
+            "GreenTotal": _channel_length(green_total),
+            "BlueTotal": _channel_length(blue_total),
+        }
+        if not setpoints:
+            found["readbacks"] = readbacks.shape[-1]
+        return found
+
+    lengths = current_lengths()
     target_len = max(lengths.values())
     for attempt in range(CROSS_CHANNEL_RETRIES):
         if min(lengths.values()) >= target_len:
@@ -671,7 +679,7 @@ async def _binned_output(
             new_green_total = await get_data(root, [uid, "primary", "GreenTotal"])
             new_blue_total = await get_data(root, [uid, "primary", "BlueTotal"])
             if setpoints:
-                new_readbacks = await get_setpoints(root, uid)
+                new_readbacks = readbacks
             else:
                 new_readbacks, _ = await get_readbacks(root, uid, None)
         except Exception as e:
@@ -690,12 +698,7 @@ async def _binned_output(
             new_blue_total,
             new_readbacks,
         )
-        lengths = {
-            "RedTotal": _channel_length(red_total),
-            "GreenTotal": _channel_length(green_total),
-            "BlueTotal": _channel_length(blue_total),
-            "readbacks": readbacks.shape[-1],
-        }
+        lengths = current_lengths()
     else:
         logger.info(
             "Giving up on cross-channel reconciliation for '%s' after %d attempt(s), "
@@ -705,8 +708,10 @@ async def _binned_output(
             lengths,
         )
 
-    common_len = min(target_len, min(lengths.values()))
-    if any(length != common_len for length in lengths.values()):
+    common_len = min(target_len, min(lengths.values()), readbacks.shape[-1])
+    if any(length != common_len for length in lengths.values()) or (
+        readbacks.shape[-1] != common_len
+    ):
         red_total = red_total[:common_len]
         green_total = green_total[:common_len]
         blue_total = blue_total[:common_len]
