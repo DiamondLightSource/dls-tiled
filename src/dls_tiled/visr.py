@@ -592,6 +592,10 @@ async def binned(  # type: ignore
     # A UI polls this several times a second per client while points arrive only
     # every couple of seconds, so identical requests share one computation (and
     # one read of the files) and its result is reused for a moment.
+    # The key leaves out who is asking. That is safe only because the data is
+    # read through root_tree.lookup_adapter, which bypasses Tiled's access policy
+    # anyway; if per-run access control is added, the key needs the principal
+    # (or its access tags), or one user's result could be served to another.
     key = (uid, tuple(sorted(request.query_params.multi_items())))
 
     async def compute():
@@ -1012,6 +1016,7 @@ async def render(  # type: ignore
         )
     root = request.app.state.root_tree
     uid = [s for s in path.strip("/").split("/") if s][0]
+    # Shared like /binned's results, and with the same caveat about access control.
     key = ("render", uid, tuple(sorted(request.query_params.multi_items())))
 
     async def compute():
