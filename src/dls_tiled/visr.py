@@ -610,10 +610,21 @@ async def binned(  # type: ignore
         return payload, f'"{hashlib.sha1(payload).hexdigest()[:20]}"'
 
     payload, etag = await _shared(key, compute)
-    headers = {"ETag": etag, "Cache-Control": "no-cache"}
-    if etag in request.headers.get("if-none-match", ""):
+    return _conditional(request, payload, "application/json", etag)
+
+
+def _conditional(request: Request, payload: bytes, media: str, tag: str) -> Response:
+    """The response, or 304 if the client already has it (``If-None-Match``).
+
+    The ETag is weak: Tiled's compression middleware may gzip the body and
+    keeps the header, so the tag can only promise the same content, not the
+    same bytes. Matching compares the quoted tag alone, so a client or proxy
+    sending it back in either form gets the 304.
+    """
+    headers = {"ETag": f"W/{tag}", "Cache-Control": "no-cache"}
+    if tag in request.headers.get("if-none-match", ""):
         return Response(status_code=304, headers=headers)
-    return Response(payload, media_type="application/json", headers=headers)
+    return Response(payload, media_type=media, headers=headers)
 
 
 class ScanPoints(NamedTuple):
@@ -1121,10 +1132,7 @@ async def render(  # type: ignore
         return payload, f'"{hashlib.sha1(payload).hexdigest()[:20]}"', media
 
     payload, etag, media = await _shared(key, compute)
-    headers = {"ETag": etag, "Cache-Control": "no-cache"}
-    if etag in request.headers.get("if-none-match", ""):
-        return Response(status_code=304, headers=headers)
-    return Response(payload, media_type=media, headers=headers)
+    return _conditional(request, payload, media, etag)
 
 
 def image_rows_are_y(img, counts) -> list[list[float | None]]:

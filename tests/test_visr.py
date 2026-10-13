@@ -512,8 +512,14 @@ def test_binned_has_an_etag_and_answers_304_when_nothing_changed(client, monkeyp
     )
 
     assert first.status_code == 200 and first.headers["cache-control"] == "no-cache"
+    assert first.headers["etag"].startswith('W/"')  # the body may be gzipped
     assert second.status_code == 304 and second.content == b""
     assert second.headers["etag"] == first.headers["etag"]
+    strong = http.get(
+        "/api/v1/binned/grid",
+        headers={"If-None-Match": first.headers["etag"].removeprefix("W/")},
+    )
+    assert strong.status_code == 304
 
 
 def test_binned_etag_changes_when_the_image_does(client):
