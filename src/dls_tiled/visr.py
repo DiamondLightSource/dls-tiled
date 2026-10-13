@@ -605,7 +605,7 @@ async def binned(  # type: ignore
             setpoints,
             slice_dim,
         )
-        payload = json.dumps(output, separators=(",", ":")).encode()
+        payload = json.dumps(output, separators=(",", ":"), allow_nan=False).encode()
         return payload, f'"{hashlib.sha1(payload).hexdigest()[:20]}"'
 
     payload, etag = await _shared(key, compute)
@@ -1113,7 +1113,9 @@ async def render(  # type: ignore
                 else {"x": offset[0], "y": offset[1]},
                 **details,
             }
-            payload = json.dumps(output, separators=(",", ":")).encode()
+            payload = json.dumps(
+                output, separators=(",", ":"), allow_nan=False
+            ).encode()
             media = "application/json"
         return payload, f'"{hashlib.sha1(payload).hexdigest()[:20]}"', media
 
@@ -1126,14 +1128,16 @@ async def render(  # type: ignore
 
 def image_rows_are_y(img, counts) -> list[list[float | None]]:
     """The binned image as plot-ready rows: one row per y bin, one column per x
-    bin, and ``None`` (JSON ``null``) where no point landed.
+    bin, and ``None`` (JSON ``null``) where no point landed or the points' mean
+    isn't a number (NaN or infinite values, which JSON can't carry).
 
     ``numpy.histogram2d`` indexes its result ``[x_bin, y_bin]``, so it is
     transposed here. An empty bin is reported as ``None`` rather than ``0`` so a
     plot can tell "no data yet" from a measured zero.
     """
-    rows = numpy.where(counts > 0, img, numpy.nan).T.astype(object)
-    rows[counts.T == 0] = None
+    shown = (counts > 0) & numpy.isfinite(img)
+    rows = img.T.astype(object)
+    rows[~shown.T] = None
     return rows.tolist()
 
 

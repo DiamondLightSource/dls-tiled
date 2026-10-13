@@ -125,6 +125,33 @@ def test_image_rows_are_y_transposes_and_marks_empty_bins():
     ]
 
 
+def strict_json(response):
+    """The response body parsed as JSON proper: NaN and Infinity are refused."""
+
+    def refuse(constant):
+        raise ValueError(f"{constant} is not valid JSON")
+
+    return json.loads(response.content, parse_constant=refuse)
+
+
+def test_binned_reports_a_bin_whose_mean_is_not_a_number_as_null(client):
+    spec = Line("Y", 0, 2, 3) * Line("X", 0, 2, 3)
+    primary = client.create_container(
+        "nan", metadata={"start": {"spec": spec.serialize()}}
+    ).create_container("primary")
+    primary.write_array(numpy.array([0.0, 1.0, 2.0] * 3), key="X")
+    primary.write_array(numpy.repeat([0.0, 1.0, 2.0], 3), key="Y")
+    values = numpy.arange(9.0)
+    values[4] = numpy.nan  # e.g. a detector frame that failed
+    values[5] = numpy.inf
+    for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
+        primary.write_array(values, key=channel)
+
+    body = strict_json(client.context.http_client.get("/api/v1/binned/nan"))
+
+    assert body["RedTotal"] == [[0.0, 1.0, 2.0], [3.0, None, None], [6.0, 7.0, 8.0]]
+
+
 def _setpoints(spec, **start):
     """Run get_setpoints against a fake root whose run has this start document."""
     metadata = {"start": {"spec": spec.serialize(), **start}}

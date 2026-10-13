@@ -244,9 +244,10 @@ def oval_layout(
 
 
 def to_rows(image) -> list[list[float | None]]:
-    """An image as JSON rows, ``None`` where nothing was drawn."""
+    """An image as JSON rows, ``None`` where nothing was drawn or the value isn't
+    a number JSON can carry (NaN or infinite)."""
     out = image.astype(object)
-    out[numpy.isnan(image)] = None
+    out[~numpy.isfinite(image)] = None
     return out.tolist()
 
 
