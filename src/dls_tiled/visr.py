@@ -720,7 +720,7 @@ async def _binned_output(
     n_points = int(readbacks.shape[-1])
 
     # mask out the points that lie outside the slice
-    mask = numpy.ones(readbacks.size, dtype=bool)
+    mask = numpy.ones(readbacks.shape[-1], dtype=bool)  # one entry per point
     if slice_dim is not None:
         for slice_spec in slice_dim:
             try:
