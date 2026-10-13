@@ -69,7 +69,7 @@ access_control:
     allowed_tags_endpoint: tiled/user_sessions
     scopes_endpoint: tiled/scopes
     modify_node_endpoint: tiled/modify_session
-    empty_access_blob_public: true  # create nodes with no access_blob without OPA
+    empty_access_blob_public: true  # allow creates with access_blob: null without asking OPA
     provider: null
 ```
 
