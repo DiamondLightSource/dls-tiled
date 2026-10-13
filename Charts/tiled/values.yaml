@@ -2,6 +2,9 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
+beamlines:
+  - name: default
+
 # The tiled server config, rendered into a ConfigMap mounted at /deploy/config.
 config:
   # Opt in to the dls-tiled plugins by listing their routers, e.g. the ViSR binning
@@ -87,8 +90,12 @@ service:
 ingress:
   enabled: false
   className: ""
+  # A single "/" path (plain "Prefix" pathType) is forwarded to the envoy
+  # proxy Service (see .Values.envoy below), which performs the actual
+  # per-beamline regex routing. Cluster policy (Kyverno) disallows
+  # "ImplementationSpecific"/regex paths directly on Ingress resources,
+  # so that routing logic lives in envoy instead of here.
   annotations: {}
-    # kubernetes.io/ingress.class: nginx
     # kubernetes.io/tls-acme: "true"
   hosts:
     - host: chart-example.local
@@ -99,6 +106,45 @@ ingress:
   #  - secretName: chart-example-tls
   #    hosts:
   #      - chart-example.local
+
+# Envoy proxy that performs regex-based routing to the per-beamline
+# Services, matching requests where the beamline name appears as a path
+# segment anywhere in the URL (e.g. /api/v1/search/p51/cm44254/cm44254-1/data) and
+# forwarding the complete, unmodified request to that beamline's own
+# Service. This exists because the Ingress resource itself can't do regex
+# path matching under the cluster's Kyverno policy (see ingress.annotations
+# comment above). Any request that doesn't match a beamline's name-in-path
+# regex (e.g. the UI at "/") falls through to the defaultBeamline's Service.
+envoy:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: envoyproxy/envoy
+    tag: v1.29-latest
+    pullPolicy: IfNotPresent
+  listenerPort: 10000
+  adminPort: 9901
+  # Name of the entry in .Values.beamlines that catch-all (unmatched) requests
+  # are routed to.
+  defaultBeamline: default
+  service:
+    type: ClusterIP
+    port: 8080
+  resources: {}
+  # Run as a fixed non-root user and bypass the image's default
+  # docker-entrypoint.sh (which chowns /dev/stdout and /dev/stderr while
+  # dropping from root to a non-root user) via `command: [envoy]` in the
+  # Deployment. That chown fails under the cluster's restricted pod
+  # permissions, so envoy is started directly as this user instead.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
 
 resources: {}
   # We usually recommend not to specify default resources and to leave this as a conscious
@@ -113,6 +159,8 @@ resources: {}
   #   memory: 128Mi
 
 # This is to setup the liveness and readiness probes more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
+# Each beamline in .Values.beamlines may set its own livenessProbe/readinessProbe
+# to override these defaults (same merge pattern as beamlines[].securityContext).
 livenessProbe:
   httpGet:
     path: /healthz

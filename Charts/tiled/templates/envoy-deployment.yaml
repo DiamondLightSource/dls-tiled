@@ -1,0 +1,61 @@
+{{- if .Values.envoy.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tiled.fullname" . }}-envoy
+  labels:
+    {{- include "tiled.labels" . | nindent 4 }}
+    app.kubernetes.io/component: envoy-proxy
+spec:
+  replicas: {{ .Values.envoy.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "tiled.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: envoy-proxy
+  template:
+    metadata:
+      labels:
+        {{- include "tiled.labels" . | nindent 8 }}
+        app.kubernetes.io/component: envoy-proxy
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/envoy-configmap.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        {{- toYaml .Values.envoy.podSecurityContext | nindent 8 }}
+      containers:
+        - name: envoy
+          image: "{{ .Values.envoy.image.repository }}:{{ .Values.envoy.image.tag }}"
+          imagePullPolicy: {{ .Values.envoy.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.envoy.securityContext | nindent 12 }}
+          command:
+            - envoy
+          args:
+            - -c
+            - /etc/envoy/envoy.yaml
+          ports:
+            - name: http
+              containerPort: {{ .Values.envoy.listenerPort }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ .Values.envoy.adminPort }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+          volumeMounts:
+            - name: envoy-config
+              mountPath: /etc/envoy
+              readOnly: true
+          resources:
+            {{- toYaml .Values.envoy.resources | nindent 12 }}
+      volumes:
+        - name: envoy-config
+          configMap:
+            name: {{ include "tiled.fullname" . }}-envoy-config
+{{- end }}
