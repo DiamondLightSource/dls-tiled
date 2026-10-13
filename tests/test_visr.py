@@ -247,7 +247,7 @@ def _grid(spec, motors=None):
 def test_grid_edges_sit_halfway_between_setpoints():
     spec = Line("sample_stage-y", 0, 2, 3) * ~Line("sample_stage-x", 0, 10, 3)
 
-    x_edges, y_edges, n_total = _grid(spec)
+    x_edges, y_edges, n_total, *_ = _grid(spec)
 
     assert x_edges.tolist() == [-2.5, 2.5, 7.5, 12.5]
     assert y_edges.tolist() == [-0.5, 0.5, 1.5, 2.5]
@@ -259,7 +259,7 @@ def test_grid_of_runs_with_repr_axes_uses_the_motors_list():
         "<Motor object at 0x2>", 0, 10, 3
     )
 
-    x_edges, y_edges, _ = _grid(spec, ["sample_stage-y", "sample_stage-x"])
+    x_edges, y_edges, *_ = _grid(spec, ["sample_stage-y", "sample_stage-x"])
 
     assert len(x_edges) == 4 and len(y_edges) == 4
 
@@ -514,30 +514,83 @@ def test_grid_of_runs_with_named_reprs_needs_no_motors_list():
         'Motor(name="sample_stage-x")', 0, 10, 3
     )
 
-    x_edges, y_edges, n_total = _grid(spec)
+    x_edges, y_edges, n_total, *_ = _grid(spec)
 
     assert x_edges.tolist() == [-2.5, 2.5, 7.5, 12.5]
     assert y_edges.tolist() == [-0.5, 0.5, 1.5, 2.5]
     assert n_total == 9
 
 
-def test_binned_keeps_the_default_binning_when_positions_are_off_the_grid(client):
-    # fly scans currently record positions offset from their setpoints
+def write_offset_scan(client, uid, x_shift, y_shift, x_scale=1.0, n_points=9):
+    """A 3x3 raster whose recorded positions are offset (and scaled) from the spec."""
     spec = Line("Y", 0, 2, 3) * Line("X", 0, 2, 3)
     metadata = {"start": {"spec": spec.serialize()}}
-    primary = client.create_container("offset", metadata=metadata).create_container(
+    primary = client.create_container(uid, metadata=metadata).create_container(
         "primary"
     )
-    primary.write_array(numpy.array([0.0, 1.0, 2.0] * 3) + 1.0, key="X")
-    primary.write_array(numpy.repeat([0.0, 1.0, 2.0], 3) + 10.4, key="Y")
+    x = numpy.array([0.0, 1.0, 2.0] * 3) * x_scale + x_shift
+    y = numpy.repeat([0.0, 1.0, 2.0], 3) + y_shift
+    primary.write_array(x[:n_points], key="X")
+    primary.write_array(y[:n_points], key="Y")
     for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
-        primary.write_array(numpy.arange(9.0), key=channel)
+        primary.write_array(numpy.arange(9.0)[:n_points], key=channel)
+
+
+def test_binned_shifts_offset_positions_onto_the_scan_grid(client):
+    # fly scans currently record positions offset from their setpoints
+    write_offset_scan(client, "offset", x_shift=1.0, y_shift=10.4)
 
     body = client.context.http_client.get("/api/v1/binned/offset").json()
 
+    assert body["RedTotal"] == [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [6.0, 7.0, 8.0]]
+    assert body["x_limits"] == [-0.5, 0.5, 1.5, 2.5]  # the spec's frame
+    assert body["position_offset"] == pytest.approx({"x": 1.0, "y": 10.4})
+
+
+def test_binned_aligns_from_the_first_points_of_an_offset_scan(client):
+    write_offset_scan(client, "early", x_shift=1.0, y_shift=10.4, n_points=2)
+
+    body = client.context.http_client.get("/api/v1/binned/early").json()
+
+    assert body["RedTotal"] == [
+        [0.0, 1.0, None],
+        [None, None, None],
+        [None, None, None],
+    ]
+    assert body["position_offset"] == pytest.approx({"x": 1.0, "y": 10.4})
+
+
+def test_binned_keeps_the_default_binning_when_no_offset_explains_the_positions(
+    client,
+):
+    write_offset_scan(client, "scaled", x_shift=1.0, y_shift=10.4, x_scale=3.0)
+
+    body = client.context.http_client.get("/api/v1/binned/scaled").json()
+
     assert len(body["RedTotal"]) == 10 and len(body["RedTotal"][0]) == 10
-    assert body["x_limits"][0] == 1.0  # the default binning spans the data
+    assert body["position_offset"] is None
     assert body["n_total"] == 9  # still known from the spec
+
+
+def test_positions_that_already_fit_are_not_shifted(client):
+    write_grid_scan(client, "fits", 9)
+
+    body = client.context.http_client.get("/api/v1/binned/fits").json()
+
+    assert body["position_offset"] is None
+
+
+def test_alignment_offset_ignores_a_dropped_point():
+    grid = _grid(Line("y", 0, 4, 5) * Line("x", 0, 4, 5))
+    x = grid.x_setpoints + 1.0
+    y = grid.y_setpoints + 10.4
+    # one point lost near the end shifts the last few points by one place
+    x, y = numpy.delete(x, 21), numpy.delete(y, 21)
+
+    aligned = visr.align_to_setpoints(x, y, grid)
+
+    assert aligned is not None
+    assert aligned[2] == pytest.approx((1.0, 10.4))
 
 
 def test_positions_fit_grid():

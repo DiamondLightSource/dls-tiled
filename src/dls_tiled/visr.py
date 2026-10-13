@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import time
+from typing import NamedTuple
 
 import anyio.to_thread
 import numpy
@@ -233,8 +234,19 @@ MAX_GRID_CELLS = int(os.getenv("DLS_TILED_VISR_MAX_GRID_CELLS", "100000"))
 MIN_CELLS_PER_AXIS = 3
 
 
+class ScanGrid(NamedTuple):
+    """A scan's setpoint grid: bin edges on x and y, the point count, and each
+    point's x and y setpoint in scan order."""
+
+    x_edges: numpy.ndarray
+    y_edges: numpy.ndarray
+    n_total: int
+    x_setpoints: numpy.ndarray
+    y_setpoints: numpy.ndarray
+
+
 @functools.lru_cache(maxsize=32)
-def _grid_from_spec(spec_json: str, motors_json: str):
+def _grid_from_spec(spec_json: str, motors_json: str) -> ScanGrid | None:
     """Bin edges for x and y and the point count of the scan the spec describes.
 
     The grid is the set of distinct setpoint positions on each axis, so every
@@ -251,13 +263,15 @@ def _grid_from_spec(spec_json: str, motors_json: str):
     if "x" not in letters or "y" not in letters or len(set(letters)) != len(letters):
         return None
     n_total = len(by_axis[axes[0]])
-    xs = numpy.unique(numpy.round(by_axis[axes[letters.index("x")]], 9))
-    ys = numpy.unique(numpy.round(by_axis[axes[letters.index("y")]], 9))
+    x_setpoints = numpy.asarray(by_axis[axes[letters.index("x")]], dtype=float)
+    y_setpoints = numpy.asarray(by_axis[axes[letters.index("y")]], dtype=float)
+    xs = numpy.unique(numpy.round(x_setpoints, 9))
+    ys = numpy.unique(numpy.round(y_setpoints, 9))
     if min(len(xs), len(ys)) < MIN_CELLS_PER_AXIS:
         return None  # a line, or too few cells for the plot's axes
     if len(xs) * len(ys) > min(n_total, MAX_GRID_CELLS):
         return None  # more cells than points: not a grid
-    return _bin_edges(xs), _bin_edges(ys), n_total
+    return ScanGrid(_bin_edges(xs), _bin_edges(ys), n_total, x_setpoints, y_setpoints)
 
 
 # Share of the recorded positions that must lie inside the spec's grid for the
@@ -268,10 +282,10 @@ MIN_POSITIONS_ON_GRID = 0.9
 def positions_fit_grid(x, y, x_edges, y_edges, uid="") -> bool:
     """Whether the recorded positions lie on the spec's grid.
 
-    The grid is in the spec's coordinates. If the recorded positions are in
-    another frame (fly scans currently record positions offset from their
-    setpoints), binning them onto that grid would leave it empty, so the
-    caller keeps the previous binning instead.
+    The grid is in the spec's coordinates. Positions recorded in another frame
+    (fly scans currently record positions offset from their setpoints) would
+    leave it empty; the caller then tries ``align_to_setpoints`` and otherwise
+    keeps the previous binning.
     """
     x, y = numpy.asarray(x, dtype=float), numpy.asarray(y, dtype=float)
     if x.size == 0:
@@ -293,6 +307,32 @@ def positions_fit_grid(x, y, x_edges, y_edges, uid="") -> bool:
         )
         return False
     return True
+
+
+def align_to_setpoints(x, y, grid: ScanGrid):
+    """Shift recorded positions into the spec's frame by a constant offset.
+
+    Fly scans currently record positions that are offset from their setpoints by
+    a constant amount per axis (the encoder capture isn't in the motors' user
+    coordinates). Each point's offset is its recorded position minus its own
+    setpoint, matched by index; the median of those is the axis offset, so a few
+    dropped or late points don't move it. Returns the shifted positions and the
+    offset ``(dx, dy)``, or None when the points don't sit within half a cell of
+    their setpoints after shifting (the frames differ by more than an offset).
+    """
+    x, y = numpy.asarray(x, dtype=float), numpy.asarray(y, dtype=float)
+    n = min(len(x), len(grid.x_setpoints))
+    if n == 0:
+        return None
+    dx = float(numpy.median(x[:n] - grid.x_setpoints[:n]))
+    dy = float(numpy.median(y[:n] - grid.y_setpoints[:n]))
+    half_x = float(numpy.min(numpy.diff(grid.x_edges))) / 2
+    half_y = float(numpy.min(numpy.diff(grid.y_edges))) / 2
+    residual_x = numpy.median(numpy.abs(x[:n] - dx - grid.x_setpoints[:n]))
+    residual_y = numpy.median(numpy.abs(y[:n] - dy - grid.y_setpoints[:n]))
+    if residual_x > half_x or residual_y > half_y:
+        return None
+    return x - dx, y - dy, (dx, dy)
 
 
 async def get_scan_grid(root, uid):
@@ -485,7 +525,9 @@ async def binned(  # type: ignore
     y bin and one column per x bin (the layout image plots expect), ``null`` for
     bins no point fell into, ``x_limits``/``y_limits`` as the bin edges (one more
     than the columns/rows), ``n_points``, the number of scan points used, and
-    ``n_total``, the number the scan will have (``null`` if the run has no spec).
+    ``n_total``, the number the scan will have (``null`` if the run has no spec),
+    and ``position_offset``: ``{"x": dx, "y": dy}`` when the recorded positions
+    were shifted onto the spec's grid (see ``align_to_setpoints``), else ``null``.
 
     Unless ``width``/``height`` or a full range are given, bins follow the scan's
     setpoint grid when its spec describes one: one cell per setpoint, a range
@@ -737,15 +779,33 @@ async def _binned_output(
     # than a fixed 10x10 over whatever extent the points received so far happen
     # to cover (which rescales the whole image as the scan fills in).
     grid = await get_scan_grid(root, uid)
-    n_total = grid[2] if grid is not None else None
+    n_total = grid.n_total if grid is not None else None
+    position_offset = None
     if (
         grid is not None
         and not explicit_bins
         and not explicit_range
         and (x_dim_index, y_dim_index) == (0, 1)
-        and positions_fit_grid(x_positions, y_positions, grid[0], grid[1], uid)
     ):
-        histogram2d_kwargs["bins"] = [grid[0], grid[1]]
+        fits = positions_fit_grid(
+            x_positions, y_positions, grid.x_edges, grid.y_edges, uid
+        )
+        if not fits:
+            # Positions recorded in another frame (fly scans, for now): bring them
+            # into the spec's frame if a constant offset per axis does it.
+            aligned = align_to_setpoints(x_positions, y_positions, grid)
+            if aligned is not None and positions_fit_grid(
+                aligned[0], aligned[1], grid.x_edges, grid.y_edges, uid
+            ):
+                x_positions, y_positions, position_offset = aligned
+                fits = True
+                logger.info(
+                    "Shifted the recorded positions of '%s' by %s to match its spec",
+                    uid,
+                    position_offset,
+                )
+        if fits:
+            histogram2d_kwargs["bins"] = [grid.x_edges, grid.y_edges]
 
     binned_output: dict = {}
     for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
@@ -759,6 +819,11 @@ async def _binned_output(
     binned_output["y_limits"] = binned_channel["y"].tolist()
     binned_output["n_points"] = n_points
     binned_output["n_total"] = n_total
+    binned_output["position_offset"] = (
+        None
+        if position_offset is None
+        else {"x": position_offset[0], "y": position_offset[1]}
+    )
 
     return binned_output
 
