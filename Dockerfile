@@ -22,7 +22,7 @@ FROM ghcr.io/bluesky/tiled:${TILED_VERSION} AS runtime
 ARG TILED_VERSION
 
 USER root
-RUN --mount=from=ghcr.io/astral-sh/uv:0.10,source=/uv,target=/bin/uv \
+RUN --mount=from=ghcr.io/astral-sh/uv:0.13,source=/uv,target=/bin/uv \
     --mount=from=build,source=/dist,target=/dist \
     uv pip install --python /app/bin/python --no-cache /dist/*.whl \
     && chown -R app:app /app
