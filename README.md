@@ -1,5 +1,5 @@
-[![CI](https://github.com/epics-containers/dls-tiled/actions/workflows/ci.yml/badge.svg)](https://github.com/epics-containers/dls-tiled/actions/workflows/ci.yml)
-[![Coverage](https://codecov.io/gh/epics-containers/dls-tiled/branch/main/graph/badge.svg)](https://codecov.io/gh/epics-containers/dls-tiled)
+[![CI](https://github.com/DiamondLightSource/dls-tiled/actions/workflows/ci.yml/badge.svg)](https://github.com/DiamondLightSource/dls-tiled/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/DiamondLightSource/dls-tiled/branch/main/graph/badge.svg)](https://codecov.io/gh/DiamondLightSource/dls-tiled)
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
@@ -14,9 +14,9 @@ the upstream one in the [bluesky tiled helm chart](https://github.com/bluesky/ti
 
 What            | Where
 :---:           | :---:
-Source          | <https://github.com/epics-containers/dls-tiled>
-Docker          | `docker run ghcr.io/epics-containers/dls-tiled:latest`
-Releases        | <https://github.com/epics-containers/dls-tiled/releases>
+Source          | <https://github.com/DiamondLightSource/dls-tiled>
+Docker          | `docker run ghcr.io/diamondlightsource/dls-tiled:latest`
+Releases        | <https://github.com/DiamondLightSource/dls-tiled/releases>
 
 ## Plugins
 

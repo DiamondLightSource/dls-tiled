@@ -34,7 +34,7 @@ dev = [
 dls-tiled = "dls_tiled.__main__:main"
 
 [project.urls]
-GitHub = "https://github.com/epics-containers/dls-tiled"
+GitHub = "https://github.com/DiamondLightSource/dls-tiled"
 
 [[project.authors]] # Further authors may be added by duplicating this section
 email = "gilesknap@gmail.com"

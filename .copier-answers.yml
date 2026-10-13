@@ -8,7 +8,7 @@ distribution_name: dls-tiled
 docker: true
 docs_type: README
 git_platform: github.com
-github_org: epics-containers
+github_org: DiamondLightSource
 package_name: dls_tiled
 pypi: false
 repo_name: dls-tiled
