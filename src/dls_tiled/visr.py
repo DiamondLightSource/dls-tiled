@@ -231,8 +231,9 @@ def _bin_edges(centres: numpy.ndarray) -> numpy.ndarray:
 
 
 # Past this many cells the native-resolution image is too much to send on every
-# poll, so the caller falls back to the coarse default binning.
-MAX_GRID_CELLS = int(os.getenv("DLS_TILED_VISR_MAX_GRID_CELLS", "100000"))
+# poll (200 x 200 is about 2.3 MB of JSON), so the caller falls back to the
+# coarse default binning.
+MAX_GRID_CELLS = int(os.getenv("DLS_TILED_VISR_MAX_GRID_CELLS", "40000"))
 # The ViSR plot needs at least three points on each axis, so a scan narrower than
 # that keeps the previous default binning.
 MIN_CELLS_PER_AXIS = 3
@@ -249,7 +250,9 @@ class ScanGrid(NamedTuple):
     y_setpoints: numpy.ndarray
 
 
-@functools.lru_cache(maxsize=32)
+# A grid keeps every point's x and y setpoint, so a scan of a million points
+# holds 16 MB; a few runs are enough, as the UI shows one or two at a time.
+@functools.lru_cache(maxsize=8)
 def _grid_from_spec(spec_json: str, motors_json: str) -> ScanGrid | None:
     """Bin edges for x and y and the point count of the scan the spec describes.
 
@@ -606,11 +609,16 @@ async def binned(  # type: ignore
             setpoints,
             slice_dim,
         )
-        payload = json.dumps(output, separators=(",", ":"), allow_nan=False).encode()
+        payload = await anyio.to_thread.run_sync(_encode_json, output)
         return payload, f'"{hashlib.sha1(payload).hexdigest()[:20]}"'
 
     payload, etag = await _shared(key, compute)
     return _conditional(request, payload, "application/json", etag)
+
+
+def _encode_json(output: dict) -> bytes:
+    """Compact JSON, refusing NaN and infinities (which JSON can't carry)."""
+    return json.dumps(output, separators=(",", ":"), allow_nan=False).encode()
 
 
 def _conditional(request: Request, payload: bytes, media: str, tag: str) -> Response:
@@ -885,16 +893,21 @@ async def _binned_output(
         assert grid is not None
         histogram2d_kwargs["bins"] = [grid.x_edges, grid.y_edges]
 
-    binned_output: dict = {}
-    for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
-        binned_channel = compute_binned_image(
-            data[channel], x_positions, y_positions, **histogram2d_kwargs
-        )
-        binned_output[channel] = image_rows_are_y(
-            binned_channel["img"], binned_channel["counts"]
-        )
-    binned_output["x_limits"] = binned_channel["x"].tolist()
-    binned_output["y_limits"] = binned_channel["y"].tolist()
+    def bin_channels() -> dict:
+        """The CPU-bound part, run off the event loop."""
+        binned_output: dict = {}
+        for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
+            binned_channel = compute_binned_image(
+                data[channel], x_positions, y_positions, **histogram2d_kwargs
+            )
+            binned_output[channel] = image_rows_are_y(
+                binned_channel["img"], binned_channel["counts"]
+            )
+        binned_output["x_limits"] = binned_channel["x"].tolist()
+        binned_output["y_limits"] = binned_channel["y"].tolist()
+        return binned_output
+
+    binned_output = await anyio.to_thread.run_sync(bin_channels)
     binned_output["n_points"] = n_points
     binned_output["n_total"] = n_total
     binned_output["position_offset"] = (
@@ -1029,9 +1042,9 @@ async def render(  # type: ignore
         )
 
         details: dict = {}
-        outline = None
         beam = None
         draw: Callable[[Any], tuple[Any, Any]]
+        outline_of: Callable[[], Any] = lambda: None  # noqa: E731
         if kind in ("gaussian", "ovals"):
             if beam_x is not None and beam_y is not None:
                 beam, source = (beam_x, beam_y), "request"
@@ -1080,55 +1093,66 @@ async def render(  # type: ignore
             )
         else:
             assert beam is not None
-            layout = rendering.oval_layout(
-                x, y, beam[0], beam[1], viewport, line_width, line_opacity
+            ovals = beam
+            layout = functools.cache(
+                lambda: rendering.oval_layout(
+                    x, y, ovals[0], ovals[1], viewport, line_width, line_opacity
+                )
             )
-            outline = layout.outline
+            outline_of = lambda: layout().outline  # noqa: E731
             details["outline_style"] = {"width": line_width, "opacity": line_opacity}
-            draw = layout.paint
+            draw = lambda v: layout().paint(v)  # noqa: E731
 
-        if format == "png":
-            image, coverage = draw(points.data[channel])
-            payload = rendering.to_png(
-                image, coverage, rendering.CHANNEL_COLOUR[channel], vmin, vmax, outline
-            )
-            media = "image/png"
-        else:
-            images = {
-                name: draw(points.data[name])
-                for name in ("RedTotal", "GreenTotal", "BlueTotal")
-            }
-            coverage = next(iter(images.values()))[1]
-            output = {
-                "kind": kind,
-                "viewport": {
-                    "x0": viewport.x0,
-                    "x1": viewport.x1,
-                    "y0": viewport.y0,
-                    "y1": viewport.y1,
-                    "width": viewport.width,
-                    "height": viewport.height,
-                },
-                "channels": {
-                    name: rendering.to_rows(img) for name, (img, _) in images.items()
-                },
-                "coverage": numpy.round(coverage, 3).tolist(),
-                **(
-                    {"outline": numpy.round(outline, 3).tolist()}
-                    if outline is not None
-                    else {}
-                ),
-                "n_points": points.n_points,
-                "n_total": grid.n_total if grid is not None else None,
-                "position_offset": None
-                if offset is None
-                else {"x": offset[0], "y": offset[1]},
-                **details,
-            }
-            payload = json.dumps(
-                output, separators=(",", ":"), allow_nan=False
-            ).encode()
-            media = "application/json"
+        def produce() -> tuple[bytes, str]:
+            """Draw and encode: the CPU-bound part, run off the event loop."""
+            outline = outline_of()
+            if format == "png":
+                image, coverage = draw(points.data[channel])
+                png = rendering.to_png(
+                    image,
+                    coverage,
+                    rendering.CHANNEL_COLOUR[channel],
+                    vmin,
+                    vmax,
+                    outline,
+                )
+                return png, "image/png"
+            else:
+                images = {
+                    name: draw(points.data[name])
+                    for name in ("RedTotal", "GreenTotal", "BlueTotal")
+                }
+                coverage = next(iter(images.values()))[1]
+                output = {
+                    "kind": kind,
+                    "viewport": {
+                        "x0": viewport.x0,
+                        "x1": viewport.x1,
+                        "y0": viewport.y0,
+                        "y1": viewport.y1,
+                        "width": viewport.width,
+                        "height": viewport.height,
+                    },
+                    "channels": {
+                        name: rendering.to_rows(img)
+                        for name, (img, _) in images.items()
+                    },
+                    "coverage": numpy.round(coverage, 3).tolist(),
+                    **(
+                        {"outline": numpy.round(outline, 3).tolist()}
+                        if outline is not None
+                        else {}
+                    ),
+                    "n_points": points.n_points,
+                    "n_total": grid.n_total if grid is not None else None,
+                    "position_offset": None
+                    if offset is None
+                    else {"x": offset[0], "y": offset[1]},
+                    **details,
+                }
+                return _encode_json(output), "application/json"
+
+        payload, media = await anyio.to_thread.run_sync(produce)
         return payload, f'"{hashlib.sha1(payload).hexdigest()[:20]}"', media
 
     payload, etag, media = await _shared(key, compute)
