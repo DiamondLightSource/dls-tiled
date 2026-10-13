@@ -33,5 +33,5 @@ USER app
 COPY log_config.yml /deploy/log_config.yml
 
 # Check the plugins import and that upstream tiled was left at its release
-RUN python -c "import dls_tiled.visr, tiled; \
+RUN python -c "import dls_tiled.visr, dls_tiled.policy, tiled; \
 assert tiled.__version__ == '${TILED_VERSION}', tiled.__version__"

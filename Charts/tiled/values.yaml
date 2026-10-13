@@ -8,6 +8,12 @@ config:
   # endpoint:
   # routers:
   #   - dls_tiled.visr:visr_router
+  # Opt in to the DLS access policy (OPA-backed; see the README for every argument):
+  # access_control:
+  #   access_policy: dls_tiled.policy:DiamondOpenPolicyAgentAuthorizationPolicy
+  #   args:
+  #     authorization_provider: http://opa:8181/v1/data/
+  #     token_audience: account
   authentication:
     allow_anonymous_access: false
   trees:
