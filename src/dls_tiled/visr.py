@@ -72,41 +72,41 @@ visr_router = APIRouter()
 
 BINNED_CACHE_SECONDS = float(os.getenv("DLS_TILED_VISR_CACHE_SECONDS", "0.5"))
 _recent: dict[tuple, tuple[float, tuple]] = {}
-_inflight: dict[tuple, asyncio.Future] = {}
+_inflight: dict[tuple, asyncio.Task] = {}
 
 
 async def _shared(key: tuple, compute):
     """Await ``compute()`` once for concurrent callers with the same key, and reuse
     its result for ``BINNED_CACHE_SECONDS``. Errors are shared with the callers
-    waiting on that call but never kept. A cache time of 0 turns this off."""
+    waiting on that call but never kept. A cache time of 0 turns this off.
+
+    The call runs as its own task, so a caller that goes away (a client
+    disconnecting cancels its request) doesn't cancel it for the others.
+    """
     if BINNED_CACHE_SECONDS <= 0:
         return await compute()
-    now = time.monotonic()
     hit = _recent.get(key)
-    if hit is not None and now - hit[0] < BINNED_CACHE_SECONDS:
+    if hit is not None and time.monotonic() - hit[0] < BINNED_CACHE_SECONDS:
         return hit[1]
-    pending = _inflight.get(key)
-    if pending is not None:
-        return await asyncio.shield(pending)
-    future: asyncio.Future = asyncio.get_running_loop().create_future()
-    # Mark any error as retrieved, so a call nobody else waited on doesn't warn.
-    future.add_done_callback(lambda f: f.cancelled() or f.exception())
-    _inflight[key] = future
+    task = _inflight.get(key)
+    if task is None:
+        task = asyncio.ensure_future(_compute_and_keep(key, compute))
+        # Mark any error as retrieved, so a call nobody waited on doesn't warn.
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        _inflight[key] = task
+    return await asyncio.shield(task)
+
+
+async def _compute_and_keep(key: tuple, compute):
     try:
         result = await compute()
-    except BaseException as error:
-        future.set_exception(error)
-        raise
-    else:
-        future.set_result(result)
-        for stale in [
-            k for k, (t, _) in _recent.items() if now - t > BINNED_CACHE_SECONDS
-        ]:
-            del _recent[stale]
-        _recent[key] = (time.monotonic(), result)
-        return result
     finally:
         _inflight.pop(key, None)
+    now = time.monotonic()
+    for stale in [k for k, (t, _) in _recent.items() if now - t > BINNED_CACHE_SECONDS]:
+        del _recent[stale]
+    _recent[key] = (now, result)
+    return result
 
 
 async def get_data(root, segments) -> H5Dataset | numpy.ndarray | dict:

@@ -442,6 +442,26 @@ def test_errors_reach_everyone_waiting_but_are_not_kept(monkeypatch):
     assert failing.calls == 1 and working.calls == 1
 
 
+def test_a_caller_going_away_does_not_cancel_the_call_for_the_others(monkeypatch):
+    monkeypatch.setattr(visr, "BINNED_CACHE_SECONDS", 0.5)
+    compute = _Counting(delay=0.05)
+
+    async def scenario():
+        first = asyncio.ensure_future(visr._shared(("uid", ()), compute))
+        await asyncio.sleep(0)  # the first caller has started the call
+        others = [
+            asyncio.ensure_future(visr._shared(("uid", ()), compute)) for _ in range(3)
+        ]
+        await asyncio.sleep(0.01)
+        first.cancel()  # e.g. its client disconnected
+        results = await asyncio.gather(*others)
+        assert first.cancelled()
+        return results
+
+    assert asyncio.run(scenario()) == [compute.result] * 3
+    assert compute.calls == 1
+
+
 def test_a_cache_time_of_zero_turns_sharing_off():
     compute = _Counting(delay=0)
 
