@@ -1,0 +1,20 @@
+apiVersion: v2
+name: tiled
+description: Tiled server (the dls-tiled image, upstream tiled plus Diamond Light Source plugins).
+
+# A chart can be either an 'application' or a 'library' chart.
+#
+# Application charts are a collection of templates that can be packaged into versioned archives
+# to be deployed.
+#
+# Library charts provide useful utilities or functions for the chart developer. They're included as
+# a dependency of application charts to inject those utilities and functions into the rendering
+# pipeline. Library charts do not define any templates and therefore cannot be deployed.
+type: application
+
+# Chart version, stamped from the git tag by CI (helm package --version)
+version: 0.0.0
+
+# Container version, stamped from the git tag by CI (helm package --app-version).
+# It is the default image tag, so a chart release deploys the image of the same tag.
+appVersion: 0.0.0

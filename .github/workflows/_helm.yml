@@ -1,0 +1,59 @@
+on:
+  workflow_call:
+    inputs:
+      publish:
+        type: boolean
+        description: If true, pushes the chart to the OCI registry (tags only)
+
+env:
+  HELM_VERSION_TO_INSTALL: 3.17.1
+
+jobs:
+  chart:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install helm
+        uses: Azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION_TO_INSTALL }}
+
+      # Chart versions must be semver. An early check saves waiting for the
+      # whole build before finding a problem.
+      - name: Check helm version tag
+        if: github.ref_type == 'tag'
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          if [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+((-alpha|-beta|-rc)\.[0-9]+)?$ ]]; then
+              echo "Valid version format: '${VERSION}'"
+          else
+              echo "Invalid version: '${VERSION}'. Expected: 'X.Y.Z' or 'X.Y.Z-beta.1'"
+              exit 1
+          fi
+
+      - name: Lint and render chart
+        run: |
+          helm lint Charts/tiled
+          helm template tiled Charts/tiled > /dev/null
+
+      # The chart version and appVersion are both the git tag. appVersion is the
+      # default image tag, so a chart release deploys the image of the same tag.
+      - name: Package helm chart
+        env:
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '0.0.0' }}
+        run: |
+          helm package --version "${VERSION}" --app-version "${VERSION}" Charts/tiled
+
+      - name: Push tagged helm chart to registry
+        if: inputs.publish && github.ref_type == 'tag'
+        env:
+          OWNER: ${{ github.repository_owner }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${TOKEN}" | helm registry login ghcr.io --username "${OWNER}" --password-stdin
+          REGISTRY="oci://ghcr.io/${OWNER}/charts"
+          helm push tiled-*.tgz "${REGISTRY,,}"
