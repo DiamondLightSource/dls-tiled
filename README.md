@@ -26,12 +26,33 @@ tiled server config.
 ### `dls_tiled.visr:visr_router`
 
 `GET /api/v1/binned/{uid}` bins a ViSR scan into a 2-D image on the server and
-returns the mean `RedTotal`, `GreenTotal` and `BlueTotal` in each bin, plus the
-bin edges as `x_limits` and `y_limits`. Positions come from the recorded
-readbacks, or from the ScanSpec setpoints in the run's start document with
-`setpoints=true`. Other query parameters: `x_dim_index`, `y_dim_index`, `width`,
-`height`, `xmin`/`xmax`/`ymin`/`ymax` and the repeatable
+returns the mean `RedTotal`, `GreenTotal` and `BlueTotal` in each bin as
+matrices with one row per y bin and one column per x bin (`null` where no point
+landed), the bin edges as `x_limits` and `y_limits`, and `n_points`/`n_total`,
+the points used so far and the points the scan will have (`null` without a
+spec). Positions come from the recorded readbacks, or from the ScanSpec
+setpoints in the run's start document with `setpoints=true`.
+
+Unless `width`/`height` or a full `xmin`/`xmax`/`ymin`/`ymax` range are given,
+the bins follow the scan's setpoint grid from its spec (one cell per setpoint,
+fixed from the first poll), provided the spec is a grid of at least 3×3 and the
+recorded positions lie on it. Positions that are off the grid by a constant
+amount per axis (as fly scans currently record them) are first shifted onto it
+by the median of each point's position minus its setpoint, and the shift is
+returned as `position_offset`. Otherwise numpy's default 10×10 over the data.
+Other query parameters: `x_dim_index`, `y_dim_index` and the repeatable
 `slice_dim=dim:center:thickness`.
+
+A file still behind the catalog is retried briefly and then answered with 503
+and `Retry-After`. Identical requests share one result for a short while and
+carry an `ETag`, so a repeated poll of an unchanged image gets a `304`.
+
+| Environment variable | Default | |
+|---|---|---|
+| `DLS_TILED_VISR_NOT_READY_RETRIES` | `3` | retries before answering 503 |
+| `DLS_TILED_VISR_NOT_READY_RETRY_DELAY` | `0.2` | seconds between those retries |
+| `DLS_TILED_VISR_CACHE_SECONDS` | `0.5` | how long a result is shared; `0` turns sharing off |
+| `DLS_TILED_VISR_MAX_GRID_CELLS` | `100000` | largest scan grid used by default |
 
 ```yaml
 routers:
