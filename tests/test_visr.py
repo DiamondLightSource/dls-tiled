@@ -548,19 +548,6 @@ def test_binned_shifts_offset_positions_onto_the_scan_grid(client):
     assert body["position_offset"] == pytest.approx({"x": 1.0, "y": 10.4})
 
 
-def test_binned_aligns_from_the_first_points_of_an_offset_scan(client):
-    write_offset_scan(client, "early", x_shift=1.0, y_shift=10.4, n_points=2)
-
-    body = client.context.http_client.get("/api/v1/binned/early").json()
-
-    assert body["RedTotal"] == [
-        [0.0, 1.0, None],
-        [None, None, None],
-        [None, None, None],
-    ]
-    assert body["position_offset"] == pytest.approx({"x": 1.0, "y": 10.4})
-
-
 def test_binned_keeps_the_default_binning_when_no_offset_explains_the_positions(
     client,
 ):
@@ -581,26 +568,117 @@ def test_positions_that_already_fit_are_not_shifted(client):
     assert body["position_offset"] is None
 
 
-def test_alignment_offset_ignores_a_dropped_point():
-    grid = _grid(Line("y", 0, 4, 5) * Line("x", 0, 4, 5))
-    x = grid.x_setpoints + 1.0
-    y = grid.y_setpoints + 10.4
+def test_binned_takes_an_offset_once_the_scan_is_past_its_first_row(client):
+    # until a row wraps, an offset can't be told from a frame gained or dropped
+    write_offset_scan(client, "row", x_shift=1.0, y_shift=10.4, n_points=3)
+    write_offset_scan(client, "wrapped", x_shift=1.0, y_shift=10.4, n_points=4)
+    http = client.context.http_client
+
+    first_row = http.get("/api/v1/binned/row").json()
+    wrapped = http.get("/api/v1/binned/wrapped").json()
+
+    assert first_row["position_offset"] is None
+    assert len(first_row["RedTotal"]) == 10  # the default binning, for now
+    assert wrapped["position_offset"] == pytest.approx({"x": 1.0, "y": 10.4})
+    assert wrapped["RedTotal"] == [
+        [0.0, 1.0, 2.0],
+        [3.0, None, None],
+        [None, None, None],
+    ]
+
+
+def raster(n=20):
+    """A raster of n x n cells of width 1, x the fast axis."""
+    return _grid(Line("y", 0, n - 1, n) * Line("x", 0, n - 1, n))
+
+
+def cells_hit(x, y, grid):
+    counts, _, _ = numpy.histogram2d(x, y, bins=[grid.x_edges, grid.y_edges])
+    return counts
+
+
+@pytest.mark.parametrize("shift", [0.5, 0.9])
+def test_place_on_grid_takes_out_an_offset_smaller_than_a_cell(shift):
+    # small enough that every position still lies inside the grid's edges
+    grid = raster()
+
+    placed = visr.place_on_grid(grid.x_setpoints + shift, grid.y_setpoints, grid)
+
+    assert placed is not None
+    assert placed[2] == pytest.approx((shift, 0.0))
+    assert numpy.all(cells_hit(placed[0], placed[1], grid) == 1)
+
+
+def test_place_on_grid_leaves_jitter_alone():
+    grid = raster()
+    jitter = numpy.random.default_rng(0).uniform(-0.05, 0.05, grid.n_total)
+
+    placed = visr.place_on_grid(grid.x_setpoints + jitter, grid.y_setpoints, grid)
+
+    assert placed is not None and placed[2] is None
+
+
+@pytest.mark.parametrize(
+    "frames",
+    ["dropped first", "extra run-up"],
+)
+def test_place_on_grid_finds_the_offset_when_a_frame_is_gained_or_lost(frames):
+    grid = raster()
+    x, y = grid.x_setpoints + 1.0, grid.y_setpoints + 10.4
+    if frames == "dropped first":
+        x, y = x[1:], y[1:]
+    else:
+        x, y = numpy.r_[x[0] - 1, x], numpy.r_[y[0], y]
+
+    placed = visr.place_on_grid(x, y, grid)
+
+    assert placed is not None
+    assert placed[2] == pytest.approx((1.0, 10.4))
+    assert cells_hit(placed[0], placed[1], grid).max() == 1
+
+
+def test_place_on_grid_finds_the_offset_despite_a_point_lost_late_in_the_scan():
+    grid = raster(5)
+    x, y = grid.x_setpoints + 1.0, grid.y_setpoints + 10.4
     # one point lost near the end shifts the last few points by one place
     x, y = numpy.delete(x, 21), numpy.delete(y, 21)
 
-    aligned = visr.align_to_setpoints(x, y, grid)
+    placed = visr.place_on_grid(x, y, grid)
 
-    assert aligned is not None
-    assert aligned[2] == pytest.approx((1.0, 10.4))
+    assert placed is not None
+    assert placed[2] == pytest.approx((1.0, 10.4))
 
 
-def test_positions_fit_grid():
-    edges = numpy.array([-0.5, 0.5, 1.5, 2.5])
-    on = numpy.array([0.0, 1.0, 2.0])
+def test_place_on_grid_without_points_is_the_bare_grid():
+    grid = raster(5)
 
-    assert visr.positions_fit_grid(on, on, edges, edges)
-    assert not visr.positions_fit_grid(on + 10, on, edges, edges)
-    assert visr.positions_fit_grid(numpy.array([]), numpy.array([]), edges, edges)
+    placed = visr.place_on_grid(numpy.array([]), numpy.array([]), grid)
+
+    assert placed is not None and placed[2] is None
+
+
+def test_binned_slice_dim_keeps_the_grid_of_an_offset_scan(client):
+    # z innermost: a slice in z leaves every other point, which must still be
+    # paired with its own setpoint to find the offset
+    spec = Line("y", 0, 2, 3) * Line("x", 0, 2, 3) * Line("z", 0, 1, 2)
+    grid = _grid(spec)
+    z_setpoints = numpy.tile([0.0, 1.0], 9)
+    write_points(
+        client,
+        "layers",
+        grid.x_setpoints + 1.0,
+        grid.y_setpoints + 10.4,
+        z_setpoints,
+        metadata={"start": {"spec": spec.serialize()}},
+    )
+
+    body = client.context.http_client.get(
+        "/api/v1/binned/layers", params={"slice_dim": "2:1:0.25"}
+    ).json()
+
+    assert body["position_offset"] == pytest.approx({"x": 1.0, "y": 10.4})
+    assert body["RedTotal"] == [[1.0, 3.0, 5.0], [7.0, 9.0, 11.0], [13.0, 15.0, 17.0]]
+    assert body["n_points"] == 9  # the points in the slice
 
 
 # --- the rest of the endpoint ---

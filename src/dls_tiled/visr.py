@@ -277,64 +277,90 @@ def _grid_from_spec(spec_json: str, motors_json: str) -> ScanGrid | None:
     return ScanGrid(_bin_edges(xs), _bin_edges(ys), n_total, x_setpoints, y_setpoints)
 
 
-# Share of the recorded positions that must lie inside the spec's grid for the
-# grid to be used for binning them.
-MIN_POSITIONS_ON_GRID = 0.9
+# The grid is used when at least this share of the recorded points lie within
+# half a cell of their own setpoint (after any offset is taken out).
+MIN_POINTS_ON_SETPOINT = 0.5
+# Offsets smaller than this share of a cell are taken as jitter and not applied.
+MIN_OFFSET_CELLS = 0.1
+# Recorded points are paired with setpoints by index, and also one setpoint
+# earlier and later, in case the capture gained or dropped a frame at the start.
+SETPOINT_LAGS = (0, 1, -1)
 
 
-def positions_fit_grid(x, y, x_edges, y_edges, uid="") -> bool:
-    """Whether the recorded positions lie on the spec's grid.
+def _first_row_length(grid: ScanGrid) -> int:
+    """Points in the scan's first row: up to the first move of its slower axis."""
 
-    The grid is in the spec's coordinates. Positions recorded in another frame
-    (fly scans currently record positions offset from their setpoints) would
-    leave it empty; the caller then tries ``align_to_setpoints`` and otherwise
-    keeps the previous binning.
+    def first_move(setpoints):
+        moved = numpy.flatnonzero(numpy.abs(setpoints - setpoints[0]) > 1e-9)
+        return int(moved[0]) if moved.size else len(setpoints)
+
+    return max(first_move(grid.x_setpoints), first_move(grid.y_setpoints))
+
+
+def place_on_grid(x, y, grid: ScanGrid, uid=""):
+    """Bring recorded positions onto the spec's grid, or None if they don't fit it.
+
+    Each recorded point is paired with its own setpoint, and the offset on each
+    axis is the median of their differences: positions captured in another
+    frame (fly scans currently record positions offset from their setpoints)
+    are shifted by it, offsets below ``MIN_OFFSET_CELLS`` of a cell are left
+    alone. The positions fit when at least ``MIN_POINTS_ON_SETPOINT`` of them
+    then lie within half a cell of their setpoint.
+
+    Points are paired by index and also one place earlier and later, keeping
+    the pairing the most points fit: a frame gained or dropped at the start
+    would otherwise give an offset one cell out that fits within each row. Only
+    the points where a row wraps tell those apart, so a non-zero offset is
+    accepted only once the scan is past its first row; before that, positions
+    that need one don't fit yet.
+
+    Returns the positions and the offset ``(dx, dy)`` applied, or None for no
+    offset.
     """
     x, y = numpy.asarray(x, dtype=float), numpy.asarray(y, dtype=float)
     if x.size == 0:
-        return True  # nothing received yet: the grid is all there is to show
-    inside = (
-        (x >= x_edges[0]) & (x <= x_edges[-1]) & (y >= y_edges[0]) & (y <= y_edges[-1])
-    )
-    share = float(inside.mean())
-    if share < MIN_POSITIONS_ON_GRID:
-        logger.info(
-            "Recorded positions for '%s' lie outside the spec's grid "
-            "(%.0f%% inside x %s..%s, y %s..%s); keeping the default binning",
-            uid,
-            100 * share,
-            x_edges[0],
-            x_edges[-1],
-            y_edges[0],
-            y_edges[-1],
+        return x, y, None  # nothing received yet: the grid is all there is to show
+    cell_x = float(numpy.min(numpy.diff(grid.x_edges)))
+    cell_y = float(numpy.min(numpy.diff(grid.y_edges)))
+    offsets_known = len(x) > _first_row_length(grid)
+    best = None  # (share on setpoint, lag is 0, dx, dy)
+    for lag in SETPOINT_LAGS:
+        # recorded point i is setpoint i + lag
+        recorded = numpy.arange(max(0, -lag), min(len(x), grid.n_total - lag))
+        if recorded.size == 0:
+            continue
+        diff_x = x[recorded] - grid.x_setpoints[recorded + lag]
+        diff_y = y[recorded] - grid.y_setpoints[recorded + lag]
+        dx, dy = 0.0, 0.0
+        if offsets_known:
+            dx, dy = float(numpy.nanmedian(diff_x)), float(numpy.nanmedian(diff_y))
+            if not (numpy.isfinite(dx) and numpy.isfinite(dy)):
+                continue
+            dx = 0.0 if abs(dx) < MIN_OFFSET_CELLS * cell_x else dx
+            dy = 0.0 if abs(dy) < MIN_OFFSET_CELLS * cell_y else dy
+        on_setpoint = (numpy.abs(diff_x - dx) <= cell_x / 2) & (
+            numpy.abs(diff_y - dy) <= cell_y / 2
         )
-        return False
-    return True
-
-
-def align_to_setpoints(x, y, grid: ScanGrid):
-    """Shift recorded positions into the spec's frame by a constant offset.
-
-    Fly scans currently record positions that are offset from their setpoints by
-    a constant amount per axis (the encoder capture isn't in the motors' user
-    coordinates). Each point's offset is its recorded position minus its own
-    setpoint, matched by index; the median of those is the axis offset, so a few
-    dropped or late points don't move it. Returns the shifted positions and the
-    offset ``(dx, dy)``, or None when the points don't sit within half a cell of
-    their setpoints after shifting (the frames differ by more than an offset).
-    """
-    x, y = numpy.asarray(x, dtype=float), numpy.asarray(y, dtype=float)
-    n = min(len(x), len(grid.x_setpoints))
-    if n == 0:
+        candidate = (float(on_setpoint.mean()), lag == 0, dx, dy)
+        if best is None or candidate[:2] > best[:2]:
+            best = candidate
+    if best is None or best[0] < MIN_POINTS_ON_SETPOINT:
+        logger.info(
+            "Recorded positions for '%s' don't lie on the spec's grid "
+            "(%.0f%% on their setpoint at best); keeping the default binning",
+            uid,
+            100 * (best[0] if best else 0.0),
+        )
         return None
-    dx = float(numpy.median(x[:n] - grid.x_setpoints[:n]))
-    dy = float(numpy.median(y[:n] - grid.y_setpoints[:n]))
-    half_x = float(numpy.min(numpy.diff(grid.x_edges))) / 2
-    half_y = float(numpy.min(numpy.diff(grid.y_edges))) / 2
-    residual_x = numpy.median(numpy.abs(x[:n] - dx - grid.x_setpoints[:n]))
-    residual_y = numpy.median(numpy.abs(y[:n] - dy - grid.y_setpoints[:n]))
-    if residual_x > half_x or residual_y > half_y:
-        return None
+    _, _, dx, dy = best
+    if dx == 0.0 and dy == 0.0:
+        return x, y, None
+    logger.info(
+        "Shifted the recorded positions of '%s' by (%s, %s) to match its spec",
+        uid,
+        dx,
+        dy,
+    )
     return x - dx, y - dy, (dx, dy)
 
 
@@ -530,7 +556,7 @@ async def binned(  # type: ignore
     than the columns/rows), ``n_points``, the number of scan points used, and
     ``n_total``, the number the scan will have (``null`` if the run has no spec),
     and ``position_offset``: ``{"x": dx, "y": dy}`` when the recorded positions
-    were shifted onto the spec's grid (see ``align_to_setpoints``), else ``null``.
+    were shifted onto the spec's grid (see ``place_on_grid``), else ``null``.
 
     Unless ``width``/``height`` or a full range are given, bins follow the scan's
     setpoint grid when its spec describes one: one cell per setpoint, a range
@@ -590,19 +616,28 @@ async def binned(  # type: ignore
 
 
 class ScanPoints(NamedTuple):
-    """The points of a run ready to draw: each channel's values and their positions."""
+    """The points of a run ready to draw: each channel's values, their positions,
+    how many there are, whether they were placed on the scan's grid, and the
+    offset taken out of the positions to do so (or None)."""
 
     data: dict
     x: numpy.ndarray
     y: numpy.ndarray
     n_points: int
+    on_grid: bool
+    offset: tuple[float, float] | None
 
 
-async def load_points(root, uid, x_dim_index, y_dim_index, setpoints, slice_dim):
+async def load_points(
+    root, uid, x_dim_index, y_dim_index, setpoints, slice_dim, grid=None
+):
     """Read a run's channels and positions, reconciled to one length and sliced.
 
     Positions are the recorded readbacks, or the spec's setpoints with
-    ``setpoints``; ``n_points`` counts the points before ``slice_dim`` is applied.
+    ``setpoints``. With a ``grid`` (for x and y as dimensions 0 and 1), the
+    positions are placed on it (see ``place_on_grid``) before ``slice_dim`` is
+    applied, since that pairs each point with its setpoint by its place in the
+    scan. ``n_points`` counts the points after slicing.
     """
     try:
         red_total = await get_data(root, [uid, "primary", "RedTotal"])
@@ -724,7 +759,15 @@ async def load_points(root, uid, x_dim_index, y_dim_index, setpoints, slice_dim)
         "GreenTotal": green_total,
         "BlueTotal": blue_total,
     }
-    n_points = int(readbacks.shape[-1])
+
+    readbacks = numpy.asarray(readbacks, dtype=float)
+    on_grid, offset = False, None
+    if grid is not None and (x_dim_index, y_dim_index) == (0, 1):
+        placed = place_on_grid(readbacks[0], readbacks[1], grid, uid)
+        if placed is not None:
+            readbacks = readbacks.copy()
+            readbacks[0], readbacks[1], offset = placed
+            on_grid = True
 
     # mask out the points that lie outside the slice
     mask = numpy.ones(readbacks.shape[-1], dtype=bool)  # one entry per point
@@ -770,7 +813,12 @@ async def load_points(root, uid, x_dim_index, y_dim_index, setpoints, slice_dim)
     )
 
     return ScanPoints(
-        data, readbacks[x_dim_index, :], readbacks[y_dim_index, :], n_points
+        data,
+        readbacks[x_dim_index, :],
+        readbacks[y_dim_index, :],
+        int(readbacks.shape[-1]),
+        on_grid,
+        offset,
     )
 
 
@@ -789,10 +837,6 @@ async def _binned_output(
     slice_dim,
 ) -> dict:
     """Compute the binned images for one run (the body of the /binned endpoint)."""
-    data, x_positions, y_positions, n_points = await load_points(
-        root, uid, x_dim_index, y_dim_index, setpoints, slice_dim
-    )
-
     # bundle the kwargs
     histogram2d_kwargs: dict = {}
     explicit_bins = all(opt is not None for opt in (width, height))
@@ -808,32 +852,26 @@ async def _binned_output(
     # to cover (which rescales the whole image as the scan fills in).
     grid = await get_scan_grid(root, uid)
     n_total = grid.n_total if grid is not None else None
-    position_offset = None
-    if (
-        grid is not None
-        and not explicit_bins
-        and not explicit_range
-        and (x_dim_index, y_dim_index) == (0, 1)
-    ):
-        fits = positions_fit_grid(
-            x_positions, y_positions, grid.x_edges, grid.y_edges, uid
-        )
-        if not fits:
-            # Positions recorded in another frame (fly scans, for now): bring them
-            # into the spec's frame if a constant offset per axis does it.
-            aligned = align_to_setpoints(x_positions, y_positions, grid)
-            if aligned is not None and positions_fit_grid(
-                aligned[0], aligned[1], grid.x_edges, grid.y_edges, uid
-            ):
-                x_positions, y_positions, position_offset = aligned
-                fits = True
-                logger.info(
-                    "Shifted the recorded positions of '%s' by %s to match its spec",
-                    uid,
-                    position_offset,
-                )
-        if fits:
-            histogram2d_kwargs["bins"] = [grid.x_edges, grid.y_edges]
+    use_grid = grid is not None and not explicit_bins and not explicit_range
+    (
+        data,
+        x_positions,
+        y_positions,
+        n_points,
+        on_grid,
+        position_offset,
+    ) = await load_points(
+        root,
+        uid,
+        x_dim_index,
+        y_dim_index,
+        setpoints,
+        slice_dim,
+        grid if use_grid else None,
+    )
+    if on_grid:
+        assert grid is not None
+        histogram2d_kwargs["bins"] = [grid.x_edges, grid.y_edges]
 
     binned_output: dict = {}
     for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
@@ -952,19 +990,9 @@ async def render(  # type: ignore
     key = ("render", uid, tuple(sorted(request.query_params.multi_items())))
 
     async def compute():
-        points = await load_points(root, uid, 0, 1, setpoints, slice_dim)
         grid = await get_scan_grid(root, uid)
-        x, y, offset = points.x, points.y, None
-        if (
-            grid is not None
-            and not setpoints
-            and not positions_fit_grid(x, y, grid.x_edges, grid.y_edges, uid)
-        ):
-            aligned = align_to_setpoints(x, y, grid)
-            if aligned is not None and positions_fit_grid(
-                aligned[0], aligned[1], grid.x_edges, grid.y_edges, uid
-            ):
-                x, y, offset = aligned
+        points = await load_points(root, uid, 0, 1, setpoints, slice_dim, grid)
+        x, y, offset = points.x, points.y, points.offset
 
         step = _nominal_step(grid) if grid is not None else None
         if grid is not None:
