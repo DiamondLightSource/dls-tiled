@@ -232,6 +232,19 @@ def test_get_data_retries_a_file_that_is_behind_the_catalog(fast_retries):
     assert adapter.reads == 3
 
 
+@pytest.mark.parametrize(("value", "count"), [("2", 2), ("0", 0), ("-1", 0)])
+def test_retry_counts_from_the_environment_are_never_negative(
+    monkeypatch, value, count
+):
+    monkeypatch.setenv("DLS_TILED_VISR_TEST_COUNT", value)
+
+    assert visr._env_count("DLS_TILED_VISR_TEST_COUNT", 3) == count
+
+
+def test_retry_counts_default_when_not_set():
+    assert visr._env_count("DLS_TILED_VISR_NOT_SET_ANYWHERE", 3) == 3
+
+
 def test_get_data_answers_503_with_retry_after_when_the_file_stays_behind(fast_retries):
     adapter = _LaggingAdapter(lag=100)
 

@@ -51,15 +51,22 @@ from dls_tiled import rendering
 
 logger = logging.getLogger(__name__)
 
-CROSS_CHANNEL_RETRIES = int(os.getenv("DLS_TILED_VISR_CROSS_CHANNEL_RETRIES", "5"))
+
+def _env_count(name: str, default: int) -> int:
+    """A non-negative count from the environment (a negative one counts as 0)."""
+    return max(0, int(os.getenv(name, str(default))))
+
+
+CROSS_CHANNEL_RETRIES = _env_count("DLS_TILED_VISR_CROSS_CHANNEL_RETRIES", 5)
 CROSS_CHANNEL_RETRY_DELAY = float(
     os.getenv("DLS_TILED_VISR_CROSS_CHANNEL_RETRY_DELAY", "0.1")
 )
 # Tiled raises DataNotReadyError when the file on disk has fewer frames than the
 # catalog advertises, i.e. a live write hasn't landed yet. It is retryable.
-NOT_READY_RETRIES = int(os.getenv("DLS_TILED_VISR_NOT_READY_RETRIES", "3"))
+NOT_READY_RETRIES = _env_count("DLS_TILED_VISR_NOT_READY_RETRIES", 3)
 NOT_READY_RETRY_DELAY = float(os.getenv("DLS_TILED_VISR_NOT_READY_RETRY_DELAY", "0.2"))
-RETRY_AFTER_SECONDS = 1
+# The Retry-After Tiled's own array routes send for the same condition.
+RETRY_AFTER_SECONDS = int(os.getenv("TILED_ARRAY_RETRY_AFTER", "1"))
 
 
 class ScanType(enum.Enum):
