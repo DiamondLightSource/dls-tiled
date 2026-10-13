@@ -46,6 +46,8 @@ from tiled.server.dependencies import get_root_tree  # type: ignore
 from tiled.server.schemas import Principal
 from tiled.type_aliases import AccessTags, Scopes
 
+from dls_tiled import rendering
+
 logger = logging.getLogger(__name__)
 
 CROSS_CHANNEL_RETRIES = int(os.getenv("DLS_TILED_VISR_CROSS_CHANNEL_RETRIES", "5"))
@@ -68,7 +70,7 @@ visr_router = APIRouter()
 
 
 BINNED_CACHE_SECONDS = float(os.getenv("DLS_TILED_VISR_CACHE_SECONDS", "0.5"))
-_recent: dict[tuple, tuple[float, tuple[bytes, str]]] = {}
+_recent: dict[tuple, tuple[float, tuple]] = {}
 _inflight: dict[tuple, asyncio.Future] = {}
 
 
@@ -586,22 +588,21 @@ async def binned(  # type: ignore
     return Response(payload, media_type="application/json", headers=headers)
 
 
-async def _binned_output(
-    root,
-    uid,
-    x_dim_index,
-    y_dim_index,
-    xmin,
-    xmax,
-    ymin,
-    ymax,
-    width,
-    height,
-    setpoints,
-    slice_dim,
-) -> dict:
-    """Compute the binned images for one run (the body of the /binned endpoint)."""
-    # load data
+class ScanPoints(NamedTuple):
+    """The points of a run ready to draw: each channel's values and their positions."""
+
+    data: dict
+    x: numpy.ndarray
+    y: numpy.ndarray
+    n_points: int
+
+
+async def load_points(root, uid, x_dim_index, y_dim_index, setpoints, slice_dim):
+    """Read a run's channels and positions, reconciled to one length and sliced.
+
+    Positions are the recorded readbacks, or the spec's setpoints with
+    ``setpoints``; ``n_points`` counts the points before ``slice_dim`` is applied.
+    """
     try:
         red_total = await get_data(root, [uid, "primary", "RedTotal"])
         green_total = await get_data(root, [uid, "primary", "GreenTotal"])
@@ -767,8 +768,29 @@ async def _binned_output(
         slice_dim is not None,
     )
 
-    x_positions = readbacks[x_dim_index, :]
-    y_positions = readbacks[y_dim_index, :]
+    return ScanPoints(
+        data, readbacks[x_dim_index, :], readbacks[y_dim_index, :], n_points
+    )
+
+
+async def _binned_output(
+    root,
+    uid,
+    x_dim_index,
+    y_dim_index,
+    xmin,
+    xmax,
+    ymin,
+    ymax,
+    width,
+    height,
+    setpoints,
+    slice_dim,
+) -> dict:
+    """Compute the binned images for one run (the body of the /binned endpoint)."""
+    data, x_positions, y_positions, n_points = await load_points(
+        root, uid, x_dim_index, y_dim_index, setpoints, slice_dim
+    )
 
     # bundle the kwargs
     histogram2d_kwargs: dict = {}
@@ -831,6 +853,212 @@ async def _binned_output(
     )
 
     return binned_output
+
+
+RENDER_KINDS = ("cells", "rectangles", "gaussian")
+MAX_RENDER_SIZE = 2048
+
+
+def _nominal_step(grid: ScanGrid) -> tuple[float, float]:
+    """The scan's step on x and y: the median width of its grid cells."""
+    return float(numpy.median(numpy.diff(grid.x_edges))), float(
+        numpy.median(numpy.diff(grid.y_edges))
+    )
+
+
+def _beam_from_metadata(start: dict) -> tuple[float, float] | None:
+    """Beam size (FWHM) from the start document's ``beam_size``, if it has one:
+    a single number, or ``{"x": ..., "y": ...}``."""
+    beam = start.get("beam_size")
+    if isinstance(beam, (int, float)):
+        return float(beam), float(beam)
+    if isinstance(beam, dict) and {"x", "y"} <= set(beam):
+        return float(beam["x"]), float(beam["y"])
+    return None
+
+
+@visr_router.get("/render/{path:path}")
+async def render(  # type: ignore
+    path: str,
+    request: Request,
+    kind: str = "cells",
+    x0: float | None = None,
+    x1: float | None = None,
+    y0: float | None = None,
+    y1: float | None = None,
+    size: int = 256,
+    setpoints: bool = False,
+    cell_x: float | None = None,
+    cell_y: float | None = None,
+    beam_x: float | None = None,
+    beam_y: float | None = None,
+    format: str = "json",
+    channel: str = "RedTotal",
+    vmin: float | None = None,
+    vmax: float | None = None,
+    slice_dim: list[str] | None = Query(None),  # noqa: B008
+    principal: Principal | None = Depends(get_current_principal),  # type: ignore  # noqa: B008
+    root_tree=Depends(get_root_tree),  # type: ignore  # noqa: B008
+    session_state: dict = Depends(get_session_state),  # type: ignore  # noqa: B008
+    authn_access_tags: AccessTags | None = Depends(get_current_access_tags),  # type: ignore  # noqa: B008
+    authn_scopes: Scopes = Depends(get_current_scopes),  # type: ignore  # noqa: B008
+    _=Security(check_scopes, scopes=["read:data"]),  # noqa: B008
+):
+    """Draw a run's points into an image for a viewport (prototype).
+
+    ``kind`` picks how each point is drawn: ``cells`` (the scan's grid cells),
+    ``rectangles`` (a nominal-size cell centred on each recorded position) or
+    ``gaussian`` (a beam-sized Gaussian per point; FWHM from ``beam_x``/``beam_y``,
+    else the start document's ``beam_size``, else the scan's step). The viewport
+    is ``x0``..``x1`` by ``y0``..``y1`` in data coordinates (default: the scan's
+    extent) at ``size`` pixels along its longer side.
+
+    ``format=json`` returns every channel as rows (row 0 at ``y0``, ``null``
+    where nothing is drawn) plus a ``coverage`` layer (0 to 1). ``format=png``
+    returns one ``channel`` as a tinted RGBA image, transparent where nothing is
+    drawn, scaled to ``vmin``/``vmax`` if given (else to its own range).
+    """
+    if kind not in RENDER_KINDS:
+        raise HTTPException(
+            status_code=400, detail=f"kind must be one of {RENDER_KINDS}"
+        )
+    if format not in ("json", "png"):
+        raise HTTPException(status_code=400, detail="format must be json or png")
+    if format == "png" and channel not in rendering.CHANNEL_COLOUR:
+        raise HTTPException(
+            status_code=400,
+            detail=f"channel must be one of {tuple(rendering.CHANNEL_COLOUR)}",
+        )
+    if not 1 <= size <= MAX_RENDER_SIZE:
+        raise HTTPException(
+            status_code=400, detail=f"size must be 1..{MAX_RENDER_SIZE}"
+        )
+    root = request.app.state.root_tree
+    uid = [s for s in path.strip("/").split("/") if s][0]
+    key = ("render", uid, tuple(sorted(request.query_params.multi_items())))
+
+    async def compute():
+        points = await load_points(root, uid, 0, 1, setpoints, slice_dim)
+        grid = await get_scan_grid(root, uid)
+        x, y, offset = points.x, points.y, None
+        if (
+            grid is not None
+            and not setpoints
+            and not positions_fit_grid(x, y, grid.x_edges, grid.y_edges, uid)
+        ):
+            aligned = align_to_setpoints(x, y, grid)
+            if aligned is not None and positions_fit_grid(
+                aligned[0], aligned[1], grid.x_edges, grid.y_edges, uid
+            ):
+                x, y, offset = aligned
+
+        step = _nominal_step(grid) if grid is not None else None
+        if grid is not None:
+            extent = (
+                grid.x_edges[0],
+                grid.x_edges[-1],
+                grid.y_edges[0],
+                grid.y_edges[-1],
+            )
+        elif len(x):
+            extent = (float(x.min()), float(x.max()), float(y.min()), float(y.max()))
+        else:
+            extent = (0.0, 1.0, 0.0, 1.0)
+        bounds = [
+            v if v is not None else e
+            for v, e in zip((x0, x1, y0, y1), extent, strict=True)
+        ]
+        if bounds[0] == bounds[1] or bounds[2] == bounds[3]:
+            raise HTTPException(status_code=400, detail="the viewport has no area")
+        viewport = rendering.Viewport.fit(
+            bounds[0], bounds[1], bounds[2], bounds[3], size
+        )
+
+        details: dict = {}
+        if kind == "cells":
+            if grid is not None:
+                edges = (grid.x_edges, grid.y_edges)
+            else:  # no spec: the previous default binning over the data
+                _, ex, ey = (
+                    numpy.histogram2d(x, y) if len(x) else (None, [0, 1], [0, 1])
+                )
+                edges = (numpy.asarray(ex), numpy.asarray(ey))
+
+            def draw(v):
+                return rendering.render_cells(v, x, y, edges[0], edges[1], viewport)
+        elif kind == "rectangles":
+            size_x = cell_x if cell_x is not None else (step[0] if step else None)
+            size_y = cell_y if cell_y is not None else (step[1] if step else None)
+            if size_x is None or size_y is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="rectangles need cell_x/cell_y if the run has no scan grid",
+                )
+            details["cell"] = {"x": size_x, "y": size_y}
+
+            def draw(v):
+                return rendering.render_rectangles(v, x, y, size_x, size_y, viewport)
+        else:
+            if beam_x is not None and beam_y is not None:
+                beam, source = (beam_x, beam_y), "request"
+            else:
+                adapter = await root.lookup_adapter([uid])
+                beam = _beam_from_metadata(adapter.metadata().get("start", {}))
+                source = "metadata"
+                if beam is None and step is not None:
+                    beam, source = step, "scan step"
+            if beam is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="gaussian needs beam_x/beam_y without a beam size or grid",
+                )
+            details["beam"] = {"x": beam[0], "y": beam[1], "source": source}
+
+            def draw(v):
+                return rendering.render_gaussian(v, x, y, beam[0], beam[1], viewport)
+
+        if format == "png":
+            image, coverage = draw(points.data[channel])
+            payload = rendering.to_png(
+                image, coverage, rendering.CHANNEL_COLOUR[channel], vmin, vmax
+            )
+            media = "image/png"
+        else:
+            images = {
+                name: draw(points.data[name])
+                for name in ("RedTotal", "GreenTotal", "BlueTotal")
+            }
+            coverage = next(iter(images.values()))[1]
+            output = {
+                "kind": kind,
+                "viewport": {
+                    "x0": viewport.x0,
+                    "x1": viewport.x1,
+                    "y0": viewport.y0,
+                    "y1": viewport.y1,
+                    "width": viewport.width,
+                    "height": viewport.height,
+                },
+                "channels": {
+                    name: rendering.to_rows(img) for name, (img, _) in images.items()
+                },
+                "coverage": numpy.round(coverage, 3).tolist(),
+                "n_points": points.n_points,
+                "n_total": grid.n_total if grid is not None else None,
+                "position_offset": None
+                if offset is None
+                else {"x": offset[0], "y": offset[1]},
+                **details,
+            }
+            payload = json.dumps(output, separators=(",", ":")).encode()
+            media = "application/json"
+        return payload, f'"{hashlib.sha1(payload).hexdigest()[:20]}"', media
+
+    payload, etag, media = await _shared(key, compute)
+    headers = {"ETag": etag, "Cache-Control": "no-cache"}
+    if etag in request.headers.get("if-none-match", ""):
+        return Response(status_code=304, headers=headers)
+    return Response(payload, media_type=media, headers=headers)
 
 
 def image_rows_are_y(img, counts) -> list[list[float | None]]:
