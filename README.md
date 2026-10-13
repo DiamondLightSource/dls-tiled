@@ -40,6 +40,44 @@ routers:
 
 Ported from Hiran Wijesinghe's [visr-tiled](https://github.com/hyperrealist/visr-tiled).
 
+## DLS access policy
+
+`dls_tiled.policy:DiamondOpenPolicyAgentAuthorizationPolicy` is a tiled access
+policy that delegates every decision to an [Open Policy Agent](https://www.openpolicyagent.org/)
+server. Each request sends OPA the user's access token and the token audience,
+plus the node's proposal, visit and beamline (from a `{"proposal", "visit",
+"beamline"}` JSON tag in the node's `access_blob`) or its session number (from
+an integer tag). Reading, creating and modifying nodes need a user principal;
+anonymous requests and service principals get a 401.
+
+- reading: OPA returns the tags the user may see (`allowed_tags_endpoint`);
+  `["*"]` means everything.
+- creating a node: OPA returns the tag to store in the new node's `access_blob`
+  (`create_node_endpoint`).
+- changing a node's `access_blob`: OPA returns a yes/no (`modify_node_endpoint`).
+- scopes on a node: OPA returns the allowed scopes (`scopes_endpoint`).
+
+Every argument, with the defaults for the optional ones:
+
+```yaml
+access_control:
+  access_policy: dls_tiled.policy:DiamondOpenPolicyAgentAuthorizationPolicy
+  args:
+    authorization_provider: http://opa:8181/v1/data/  # OPA data API base URL
+    token_audience: account                           # sent to OPA as "audience"
+    create_node_endpoint: tiled/user_session
+    allowed_tags_endpoint: tiled/user_sessions
+    scopes_endpoint: tiled/scopes
+    modify_node_endpoint: tiled/modify_session
+    empty_access_blob_public: true  # create nodes with no access_blob without OPA
+    provider: null
+```
+
+The endpoints are appended to `authorization_provider` as they are, so it needs
+a trailing `/`.
+
+Ported from Zoheb Shaikh's [diamond-tiled](https://github.com/DiamondLightSource/diamond-tiled).
+
 ## Helm chart
 
 `Charts/tiled` is a generic Helm chart for the image, published on each tag to
