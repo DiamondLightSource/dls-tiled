@@ -123,6 +123,46 @@ def test_gaussian_weights_overlapping_beams_by_distance():
     )  # nearer the first point, then the second
 
 
+def test_ovals_split_an_overlap_along_the_line_through_the_crossings():
+    # circles of radius 1 at x = 1 and x = 2.5 cross at x = 1.75
+    layout = rendering.oval_layout(
+        [1.0, 2.5], [1.0, 1.0], 2.0, 2.0, Viewport.fit(0, 4, 0, 2, 80)
+    )
+    image, coverage = layout.paint([10.0, 20.0])
+
+    middle_row = image[20]
+    assert middle_row[34] == 10.0 and middle_row[35] == 20.0  # x = 1.725 | 1.775
+    assert numpy.isnan(middle_row[75]) and coverage[20, 75] == 0.0  # x = 3.775
+
+
+def test_ovals_are_scaled_on_each_axis():
+    layout = rendering.oval_layout([2.0], [2.0], 2.0, 1.0, Viewport.fit(0, 4, 0, 4, 40))
+
+    assert layout.owner[20, 11] == 0  # x = 1.15: inside, 1 wide each side
+    assert layout.owner[14, 20] == -1  # y = 1.45: outside, 0.5 high each side
+
+
+def test_oval_outlines_are_faint_and_whole_even_inside_another_oval():
+    layout = rendering.oval_layout(
+        [1.0, 2.5], [1.0, 1.0], 2.0, 2.0, Viewport.fit(0, 4, 0, 2, 200)
+    )
+
+    # where each circle's outline runs inside the other: the second's leftmost
+    # point (x = 1.5) and the first's rightmost (x = 2), both at y = 1
+    assert layout.outline[49:52, 74:77].max() > 0.25
+    assert layout.outline[49:52, 99:102].max() > 0.25
+    assert layout.outline.max() == pytest.approx(0.35)  # never more than faint
+    assert layout.outline[50, 50] == 0.0  # inside, away from any outline
+
+
+def test_oval_outlines_can_be_turned_off():
+    layout = rendering.oval_layout(
+        [1.0], [1.0], 2.0, 2.0, Viewport.fit(0, 2, 0, 2, 40), line_opacity=0
+    )
+
+    assert layout.outline.max() == 0.0
+
+
 def test_png_is_a_png_of_the_viewport_size_with_transparent_gaps():
     image = numpy.array([[1.0, numpy.nan], [2.0, 3.0]])
     payload = rendering.to_png(image, numpy.ones_like(image), colour=1)
@@ -249,6 +289,19 @@ def test_render_shows_the_scan_extent_from_its_first_points(client):
     assert body["n_points"] == 2
 
 
+def test_render_ovals_returns_an_outline_layer(client):
+    write_scan(client, "ovals")
+
+    body = get(client, "ovals", kind="ovals", beam_x=1.3, beam_y=1.3, size=30).json()
+
+    assert body["beam"]["source"] == "request"
+    outline = numpy.array(body["outline"])
+    assert outline.shape == (30, 30) and outline.max() == pytest.approx(0.35)
+    assert body["channels"]["RedTotal"][15][15] == 4.0  # the centre point
+    png = get(client, "ovals", kind="ovals", format="png", size=30)
+    assert png.headers["content-type"] == "image/png"
+
+
 @pytest.mark.parametrize(
     "params",
     [
@@ -257,6 +310,8 @@ def test_render_shows_the_scan_extent_from_its_first_points(client):
         {"format": "png", "channel": "GrayTotal"},
         {"size": 0},
         {"x0": 1.0, "x1": 1.0},
+        {"kind": "ovals", "line_width": 0},
+        {"kind": "ovals", "line_opacity": 1.5},
     ],
 )
 def test_render_rejects_bad_requests(client, params):

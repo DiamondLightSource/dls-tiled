@@ -11,6 +11,8 @@ Row 0 is the viewport's ``y0`` edge and column 0 its ``x0`` edge.
   position, so the picture follows where the points really were.
 - ``gaussian``: a beam-sized 2-D Gaussian per point, so any gaps the scan left
   between beam footprints show up as low coverage.
+- ovals (``oval_layout``): a beam-sized oval per point, filled with its value
+  and faintly outlined; overlaps are split between the ovals, not blended.
 """
 
 from __future__ import annotations
@@ -172,6 +174,75 @@ def render_gaussian(values, x, y, fwhm_x, fwhm_y, viewport: Viewport, reach=3.0)
     return image, coverage
 
 
+@dataclass(frozen=True)
+class OvalLayout:
+    """Where each point's oval is drawn in a viewport, independent of any channel.
+
+    ``owner`` is the index of the point each pixel takes its colour from (-1
+    outside every oval) and ``outline`` the opacity (0 to 1) of the white
+    outlines drawn over the colours.
+    """
+
+    owner: numpy.ndarray
+    outline: numpy.ndarray
+
+    def paint(self, values):
+        """One channel's image and coverage: each oval filled with its point's value."""
+        values = numpy.asarray(values, dtype=float)
+        image = numpy.full(self.owner.shape, numpy.nan)
+        inside = self.owner >= 0
+        image[inside] = values[self.owner[inside]]
+        return image, (~numpy.isnan(image)).astype(float)
+
+
+def oval_layout(
+    x, y, width_x, width_y, viewport: Viewport, line_width=1.5, line_opacity=0.35
+) -> OvalLayout:
+    """An oval ``width_x`` by ``width_y`` (data units) centred on each point.
+
+    Where ovals overlap, the overlap is split along the line through the two
+    points where their outlines cross, each side taking the colour of its own
+    oval. For ovals of one size that line is where the two centres are equally
+    far in units of the ovals' radii, so each pixel takes the oval whose
+    centre is nearest in those units; that also splits three-way overlaps
+    consistently.
+
+    Every oval's whole outline is drawn as a faint white line, ``line_width``
+    pixels wide at ``line_opacity`` (0 for none).
+    """
+    a = width_x / 2 / viewport.pixel_x  # semi-axes in pixels
+    b = width_y / 2 / viewport.pixel_y
+    px, py = viewport.column(x), viewport.row(y)
+    shape = (viewport.height, viewport.width)
+    best = numpy.full(shape, numpy.inf)  # the nearest centre, in radii squared
+    owner = numpy.full(shape, -1)
+    outline = numpy.zeros(shape)
+    pad = line_width + 1  # reach past the oval far enough to draw its outline
+    for i in numpy.flatnonzero(numpy.isfinite(px) & numpy.isfinite(py)):
+        c_lo = max(0, int(numpy.floor(px[i] - a - pad)))
+        c_hi = min(viewport.width, int(numpy.ceil(px[i] + a + pad)))
+        r_lo = max(0, int(numpy.floor(py[i] - b - pad)))
+        r_hi = min(viewport.height, int(numpy.ceil(py[i] + b + pad)))
+        if c_lo >= c_hi or r_lo >= r_hi:
+            continue
+        window = (slice(r_lo, r_hi), slice(c_lo, c_hi))
+        dx = (numpy.arange(c_lo, c_hi) + 0.5 - px[i]) / a  # in radii
+        dy = (numpy.arange(r_lo, r_hi) + 0.5 - py[i]) / b
+        q = dy[:, None] ** 2 + dx[None, :] ** 2  # < 1 inside the oval
+        nearer = q < best[window]
+        best[window][nearer] = q[nearer]
+        owner[window][nearer] = i
+        if line_opacity > 0:
+            # distance to the outline in pixels, to first order
+            r = numpy.sqrt(q)
+            with numpy.errstate(divide="ignore", invalid="ignore"):
+                gradient = numpy.hypot(dx[None, :] / a, dy[:, None] / b) / r
+                distance = numpy.where(r > 0, (r - 1) / gradient, numpy.inf)
+            line = numpy.clip(line_width / 2 + 0.5 - numpy.abs(distance), 0.0, 1.0)
+            outline[window] = numpy.maximum(outline[window], line * line_opacity)
+    return OvalLayout(numpy.where(best < 1, owner, -1), outline)
+
+
 def to_rows(image) -> list[list[float | None]]:
     """An image as JSON rows, ``None`` where nothing was drawn."""
     out = image.astype(object)
@@ -182,18 +253,32 @@ def to_rows(image) -> list[list[float | None]]:
 CHANNEL_COLOUR = {"RedTotal": 0, "GreenTotal": 1, "BlueTotal": 2}
 
 
-def to_png(image, coverage, colour=0, vmin=None, vmax=None) -> bytes:
+def to_png(image, coverage, colour=0, vmin=None, vmax=None, outline=None) -> bytes:
     """An RGBA PNG of one channel, tinted (0/1/2 = red/green/blue), transparent
-    where nothing was drawn. Row 0 of the image is the top row of the PNG."""
+    where nothing was drawn, with an optional white ``outline`` layer (opacity
+    0 to 1) drawn over it. Row 0 of the image is the top row of the PNG."""
     valid = image[~numpy.isnan(image)]
     lo = float(valid.min()) if vmin is None and valid.size else (vmin or 0.0)
     hi = float(valid.max()) if vmax is None and valid.size else (vmax or 1.0)
     scaled = numpy.zeros(image.shape)
     if hi > lo:
-        scaled = (numpy.nan_to_num(image, nan=lo) - lo) / (hi - lo)
-    rgba = numpy.zeros(image.shape + (4,), dtype=numpy.uint8)
-    rgba[..., colour] = numpy.clip(numpy.round(scaled * 255), 0, 255)
+        scaled = numpy.clip((numpy.nan_to_num(image, nan=lo) - lo) / (hi - lo), 0, 1)
+    rgb = numpy.zeros(image.shape + (3,))
+    rgb[..., colour] = scaled
     alpha = numpy.where(numpy.isnan(image), 0.0, coverage)
+    if outline is not None:
+        # white over the colour, where the colour itself may be transparent
+        total = outline + alpha * (1 - outline)
+        with numpy.errstate(divide="ignore", invalid="ignore"):
+            rgb = numpy.where(
+                total[..., None] > 0,
+                (outline[..., None] + rgb * (alpha * (1 - outline))[..., None])
+                / total[..., None],
+                0.0,
+            )
+        alpha = total
+    rgba = numpy.zeros(image.shape + (4,), dtype=numpy.uint8)
+    rgba[..., :3] = numpy.clip(numpy.round(rgb * 255), 0, 255)
     rgba[..., 3] = numpy.clip(numpy.round(alpha * 255), 0, 255)
     return _encode_png(rgba)
 

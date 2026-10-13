@@ -13,7 +13,8 @@ import logging
 import os
 import re
 import time
-from typing import NamedTuple
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import anyio.to_thread
 import numpy
@@ -855,7 +856,7 @@ async def _binned_output(
     return binned_output
 
 
-RENDER_KINDS = ("cells", "rectangles", "gaussian")
+RENDER_KINDS = ("cells", "rectangles", "gaussian", "ovals")
 MAX_RENDER_SIZE = 2048
 
 
@@ -896,6 +897,8 @@ async def render(  # type: ignore
     channel: str = "RedTotal",
     vmin: float | None = None,
     vmax: float | None = None,
+    line_width: float = 1.5,
+    line_opacity: float = 0.35,
     slice_dim: list[str] | None = Query(None),  # noqa: B008
     principal: Principal | None = Depends(get_current_principal),  # type: ignore  # noqa: B008
     root_tree=Depends(get_root_tree),  # type: ignore  # noqa: B008
@@ -907,16 +910,22 @@ async def render(  # type: ignore
     """Draw a run's points into an image for a viewport (prototype).
 
     ``kind`` picks how each point is drawn: ``cells`` (the scan's grid cells),
-    ``rectangles`` (a nominal-size cell centred on each recorded position) or
-    ``gaussian`` (a beam-sized Gaussian per point; FWHM from ``beam_x``/``beam_y``,
-    else the start document's ``beam_size``, else the scan's step). The viewport
+    ``rectangles`` (a nominal-size cell centred on each recorded position),
+    ``gaussian`` (a beam-sized Gaussian per point) or ``ovals`` (a beam-sized
+    oval per point with a faint white outline, ``line_width`` pixels at
+    ``line_opacity``; overlaps are split between the ovals rather than blended,
+    see ``rendering.oval_layout``). The beam size (FWHM) comes from
+    ``beam_x``/``beam_y``, else the start document's ``beam_size``, else the
+    scan's step. The viewport
     is ``x0``..``x1`` by ``y0``..``y1`` in data coordinates (default: the scan's
     extent) at ``size`` pixels along its longer side.
 
     ``format=json`` returns every channel as rows (row 0 at ``y0``, ``null``
     where nothing is drawn) plus a ``coverage`` layer (0 to 1). ``format=png``
     returns one ``channel`` as a tinted RGBA image, transparent where nothing is
-    drawn, scaled to ``vmin``/``vmax`` if given (else to its own range).
+    drawn, scaled to ``vmin``/``vmax`` if given (else to its own range). For
+    ``ovals``, JSON adds an ``outline`` layer (opacity of the white lines) and
+    the PNG has the lines drawn in.
     """
     if kind not in RENDER_KINDS:
         raise HTTPException(
@@ -932,6 +941,11 @@ async def render(  # type: ignore
     if not 1 <= size <= MAX_RENDER_SIZE:
         raise HTTPException(
             status_code=400, detail=f"size must be 1..{MAX_RENDER_SIZE}"
+        )
+    if not (0 < line_width <= 20 and 0 <= line_opacity <= 1):
+        raise HTTPException(
+            status_code=400,
+            detail="line_width must be in (0, 20], line_opacity in [0, 1]",
         )
     root = request.app.state.root_tree
     uid = [s for s in path.strip("/").split("/") if s][0]
@@ -975,30 +989,10 @@ async def render(  # type: ignore
         )
 
         details: dict = {}
-        if kind == "cells":
-            if grid is not None:
-                edges = (grid.x_edges, grid.y_edges)
-            else:  # no spec: the previous default binning over the data
-                _, ex, ey = (
-                    numpy.histogram2d(x, y) if len(x) else (None, [0, 1], [0, 1])
-                )
-                edges = (numpy.asarray(ex), numpy.asarray(ey))
-
-            def draw(v):
-                return rendering.render_cells(v, x, y, edges[0], edges[1], viewport)
-        elif kind == "rectangles":
-            size_x = cell_x if cell_x is not None else (step[0] if step else None)
-            size_y = cell_y if cell_y is not None else (step[1] if step else None)
-            if size_x is None or size_y is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="rectangles need cell_x/cell_y if the run has no scan grid",
-                )
-            details["cell"] = {"x": size_x, "y": size_y}
-
-            def draw(v):
-                return rendering.render_rectangles(v, x, y, size_x, size_y, viewport)
-        else:
+        outline = None
+        beam = None
+        draw: Callable[[Any], tuple[Any, Any]]
+        if kind in ("gaussian", "ovals"):
             if beam_x is not None and beam_y is not None:
                 beam, source = (beam_x, beam_y), "request"
             else:
@@ -1010,17 +1004,53 @@ async def render(  # type: ignore
             if beam is None:
                 raise HTTPException(
                     status_code=400,
-                    detail="gaussian needs beam_x/beam_y without a beam size or grid",
+                    detail=f"{kind} needs beam_x/beam_y without a beam size or grid",
                 )
             details["beam"] = {"x": beam[0], "y": beam[1], "source": source}
 
-            def draw(v):
-                return rendering.render_gaussian(v, x, y, beam[0], beam[1], viewport)
+        if kind == "cells":
+            if grid is not None:
+                edges = (grid.x_edges, grid.y_edges)
+            else:  # no spec: the previous default binning over the data
+                _, ex, ey = (
+                    numpy.histogram2d(x, y) if len(x) else (None, [0, 1], [0, 1])
+                )
+                edges = (numpy.asarray(ex), numpy.asarray(ey))
+
+            draw = lambda v: rendering.render_cells(  # noqa: E731
+                v, x, y, edges[0], edges[1], viewport
+            )
+        elif kind == "rectangles":
+            size_x = cell_x if cell_x is not None else (step[0] if step else None)
+            size_y = cell_y if cell_y is not None else (step[1] if step else None)
+            if size_x is None or size_y is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="rectangles need cell_x/cell_y if the run has no scan grid",
+                )
+            details["cell"] = {"x": size_x, "y": size_y}
+
+            draw = lambda v: rendering.render_rectangles(  # noqa: E731
+                v, x, y, size_x, size_y, viewport
+            )
+        elif kind == "gaussian":
+            assert beam is not None
+            draw = lambda v: rendering.render_gaussian(  # noqa: E731
+                v, x, y, beam[0], beam[1], viewport
+            )
+        else:
+            assert beam is not None
+            layout = rendering.oval_layout(
+                x, y, beam[0], beam[1], viewport, line_width, line_opacity
+            )
+            outline = layout.outline
+            details["outline_style"] = {"width": line_width, "opacity": line_opacity}
+            draw = layout.paint
 
         if format == "png":
             image, coverage = draw(points.data[channel])
             payload = rendering.to_png(
-                image, coverage, rendering.CHANNEL_COLOUR[channel], vmin, vmax
+                image, coverage, rendering.CHANNEL_COLOUR[channel], vmin, vmax, outline
             )
             media = "image/png"
         else:
@@ -1043,6 +1073,11 @@ async def render(  # type: ignore
                     name: rendering.to_rows(img) for name, (img, _) in images.items()
                 },
                 "coverage": numpy.round(coverage, 3).tolist(),
+                **(
+                    {"outline": numpy.round(outline, 3).tolist()}
+                    if outline is not None
+                    else {}
+                ),
                 "n_points": points.n_points,
                 "n_total": grid.n_total if grid is not None else None,
                 "position_offset": None
