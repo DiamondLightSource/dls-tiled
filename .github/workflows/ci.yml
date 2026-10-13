@@ -38,11 +38,12 @@ jobs:
       packages: write
 
   helm:
-    needs: test
+    # The chart's default image is the one container pushes for the same tag
+    needs: [test, container]
     if: always()
     uses: ./.github/workflows/_helm.yml
     with:
-      publish: ${{ needs.test.result == 'success' }}
+      publish: ${{ needs.test.result == 'success' && needs.container.result == 'success' }}
     permissions:
       contents: read
       packages: write
