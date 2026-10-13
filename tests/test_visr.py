@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 from types import SimpleNamespace
 
@@ -600,3 +601,278 @@ def test_positions_fit_grid():
     assert visr.positions_fit_grid(on, on, edges, edges)
     assert not visr.positions_fit_grid(on + 10, on, edges, edges)
     assert visr.positions_fit_grid(numpy.array([]), numpy.array([]), edges, edges)
+
+
+# --- the rest of the endpoint ---
+
+
+@pytest.fixture
+def app_and_client(tmp_path):
+    """Like `client`, with the app too, for tests that reach into its tree."""
+    catalog = in_memory(writable_storage=str(tmp_path))
+    app = build_app(catalog, include_routers=[visr_router])
+    with Context.from_app(app) as context:
+        yield app, from_context(context)
+
+
+@pytest.fixture
+def fast_reconciliation(monkeypatch):
+    monkeypatch.setattr(visr, "CROSS_CHANNEL_RETRY_DELAY", 0.0)
+
+
+def write_points(
+    client, uid, x, y, z=None, channels=None, where="primary", metadata=None
+):
+    """Write positions and the three channels of a run, positions under `where`."""
+    run = client.create_container(uid, metadata=metadata or {})
+    primary = run.create_container("primary")
+    target = primary if where == "primary" else primary.create_container(where)
+    names = {"X": "X", "Y": "Y", "Z": "Z"}
+    if where != "primary" or channels == "named":
+        names = {"X": "sample_stage-x", "Y": "sample_stage-y", "Z": "sample_stage-z"}
+    target.write_array(numpy.asarray(x, dtype=float), key=names["X"])
+    target.write_array(numpy.asarray(y, dtype=float), key=names["Y"])
+    if z is not None:
+        target.write_array(numpy.asarray(z, dtype=float), key=names["Z"])
+    values = numpy.arange(float(len(x)))
+    for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
+        primary.write_array(values, key=channel)
+
+
+# setpoints=true over HTTP
+
+
+def test_binned_setpoints_mode_bins_the_specs_positions(client):
+    # readbacks far off the spec: setpoints mode must not use them
+    spec = Line("Y", 0, 2, 3) * Line("X", 0, 2, 3)
+    write_points(
+        client,
+        "sp",
+        numpy.full(9, 50.0),
+        numpy.full(9, 50.0),
+        metadata={"start": {"spec": spec.serialize()}},
+    )
+
+    body = client.context.http_client.get(
+        "/api/v1/binned/sp", params={"setpoints": True}
+    ).json()
+
+    assert body["RedTotal"] == [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [6.0, 7.0, 8.0]]
+    assert body["x_limits"] == [-0.5, 0.5, 1.5, 2.5]
+    assert body["position_offset"] is None
+
+
+def test_binned_setpoints_mode_on_a_scan_still_running(client, monkeypatch):
+    spec = Line("Y", 0, 2, 3) * Line("X", 0, 2, 3)
+    write_points(
+        client,
+        "running",
+        numpy.zeros(7),
+        numpy.zeros(7),
+        metadata={"start": {"spec": spec.serialize()}},
+    )
+    calls = []
+    real = visr.get_setpoints
+
+    async def counting(root, uid):
+        calls.append(uid)
+        return await real(root, uid)
+
+    monkeypatch.setattr(visr, "get_setpoints", counting)
+
+    body = client.context.http_client.get(
+        "/api/v1/binned/running", params={"setpoints": True}
+    ).json()
+
+    assert body["RedTotal"] == [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [6.0, None, None]]
+    assert body["n_points"] == 7
+    # the setpoints are complete from the start: nothing to wait for
+    assert len(calls) == 1
+
+
+def test_binned_setpoints_mode_without_a_spec_is_422(client):
+    write_step_scan(client)
+
+    response = client.context.http_client.get(
+        "/api/v1/binned/scan", params={"setpoints": True}
+    )
+
+    assert response.status_code == 422
+    assert "start.spec" in response.json()["detail"]
+
+
+# slice_dim
+
+
+def test_binned_slice_dim_keeps_only_points_in_the_slice(client):
+    # two layers in z; only the z = 0 layer is kept
+    x = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+    y = [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0]
+    z = [0.0, 0.0, 0.0, 0.0, 5.0, 5.0, 5.0, 5.0]
+    write_points(client, "layers", x, y, z)
+
+    body = client.context.http_client.get(
+        "/api/v1/binned/layers",
+        params={"width": 2, "height": 2, "slice_dim": "2:0:0.5"},
+    ).json()
+
+    assert body["RedTotal"] == [[0.0, 1.0], [2.0, 3.0]]
+
+
+@pytest.mark.parametrize(
+    ("slice_dim", "message"),
+    [
+        ("not-a-slice", "Invalid slice_dim format"),
+        ("7:0:1", "out of range"),
+        ("0:0:1", "cannot contain x or y"),
+    ],
+)
+def test_binned_rejects_a_bad_slice_dim(client, slice_dim, message):
+    write_step_scan(client)
+
+    response = client.context.http_client.get(
+        "/api/v1/binned/scan", params={"slice_dim": slice_dim}
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+# x_dim_index / y_dim_index
+
+
+def test_binned_swapping_the_dimension_indices_transposes_the_image(client):
+    write_points(client, "swap", [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0])
+    http = client.context.http_client
+    size = {"width": 2, "height": 2}
+
+    normal = http.get("/api/v1/binned/swap", params=size).json()
+    swapped = http.get(
+        "/api/v1/binned/swap", params={**size, "x_dim_index": 1, "y_dim_index": 0}
+    ).json()
+
+    assert normal["RedTotal"] == [[0.0, 1.0], [2.0, 3.0]]
+    assert swapped["RedTotal"] == [[0.0, 2.0], [1.0, 3.0]]
+
+
+# where the positions live
+
+
+@pytest.mark.parametrize("where", ["internal", "named"])
+def test_binned_finds_positions_wherever_the_run_stores_them(client, where):
+    # older fly scans: primary/internal/sample_stage-x; others: primary/sample_stage-x
+    x, y = [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]
+    if where == "internal":
+        write_points(client, where, x, y, where="internal")
+    else:
+        write_points(client, where, x, y, channels="named")
+
+    body = client.context.http_client.get(
+        f"/api/v1/binned/{where}", params={"width": 2, "height": 2}
+    ).json()
+
+    assert body["RedTotal"] == [[0.0, 1.0], [2.0, 3.0]]
+    assert body["n_points"] == 4
+
+
+# length reconciliation during a live write
+
+
+def test_binned_truncates_to_the_shortest_channel_if_they_never_agree(
+    client, fast_reconciliation
+):
+    primary = client.create_container("ragged").create_container("primary")
+    primary.write_array(numpy.array([0.0, 1.0, 0.0, 1.0]), key="X")
+    primary.write_array(numpy.array([0.0, 0.0, 1.0, 1.0]), key="Y")
+    primary.write_array(numpy.arange(3.0), key="RedTotal")  # one frame behind
+    primary.write_array(numpy.arange(4.0), key="GreenTotal")
+    primary.write_array(numpy.arange(4.0), key="BlueTotal")
+
+    body = client.context.http_client.get(
+        "/api/v1/binned/ragged", params={"width": 2, "height": 2}
+    ).json()
+
+    assert body["n_points"] == 3
+    assert body["GreenTotal"] == [[0.0, 1.0], [2.0, None]]
+
+
+def test_binned_waits_for_a_channel_that_catches_up(
+    client, fast_reconciliation, monkeypatch
+):
+    write_points(client, "catching", [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0])
+    real = visr.get_data
+    seen = {"RedTotal": 0}
+
+    async def lagging(root, segments):
+        data = await real(root, segments)
+        if segments[-1] == "RedTotal":
+            seen["RedTotal"] += 1
+            if seen["RedTotal"] == 1:
+                return data[:3]  # the first read lands a frame behind
+        return data
+
+    monkeypatch.setattr(visr, "get_data", lagging)
+
+    body = client.context.http_client.get(
+        "/api/v1/binned/catching", params={"width": 2, "height": 2}
+    ).json()
+
+    assert body["n_points"] == 4
+    assert body["RedTotal"] == [[0.0, 1.0], [2.0, 3.0]]
+    assert seen["RedTotal"] >= 2
+
+
+def test_binned_truncates_positions_that_arrive_at_different_lengths(
+    client, fast_reconciliation
+):
+    primary = client.create_container("axes").create_container("primary")
+    primary.write_array(numpy.array([0.0, 1.0, 0.0, 1.0]), key="X")
+    primary.write_array(numpy.array([0.0, 0.0, 1.0]), key="Y")  # one point behind
+    for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
+        primary.write_array(numpy.arange(4.0), key=channel)
+
+    body = client.context.http_client.get(
+        "/api/v1/binned/axes", params={"width": 2, "height": 2}
+    ).json()
+
+    assert body["n_points"] == 3
+
+
+# a file still behind the catalog, through the whole app
+
+
+@pytest.mark.parametrize(("lag", "status"), [(2, 200), (100, 503)])
+def test_binned_retries_a_lagging_file_then_answers_503(
+    app_and_client, monkeypatch, fast_retries, lag, status
+):
+    app, client = app_and_client
+    write_points(client, "lagging", [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0])
+    tree = app.state.root_tree
+    real_lookup = tree.lookup_adapter
+    reads = {"n": 0}
+
+    class Lagging:
+        def __init__(self, adapter):
+            self.adapter = adapter
+
+        async def read(self, *args, **kwargs):
+            reads["n"] += 1
+            if reads["n"] <= lag:
+                raise DataNotReadyError("advertises (4,), only (3,) available")
+            result = self.adapter.read(*args, **kwargs)
+            return await result if inspect.isawaitable(result) else result
+
+    async def lookup(segments):
+        adapter = await real_lookup(segments)
+        # the catalog calls lookup_adapter recursively with shorter paths too
+        return Lagging(adapter) if segments and segments[-1] == "RedTotal" else adapter
+
+    monkeypatch.setattr(tree, "lookup_adapter", lookup)
+
+    response = client.context.http_client.get(
+        "/api/v1/binned/lagging", params={"width": 2, "height": 2}
+    )
+
+    assert response.status_code == status, response.text
+    if status == 503:
+        assert response.headers["retry-after"] == "1"
