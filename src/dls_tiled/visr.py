@@ -175,7 +175,8 @@ def _axis_letter(name: object) -> str | None:
     return letter if letter in _AXIS_LETTERS else None
 
 
-_REPR_NAME_RE = re.compile(r"""name=["']([^"']+)["']""")
+# The ``name=`` argument of a repr, not one that merely ends in it (``device_name=``)
+_REPR_NAME_RE = re.compile(r"""(?:\(|,\s*)name=["']([^"']+)["']""")
 
 
 def _axis_name(axis: object) -> str | None:

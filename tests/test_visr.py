@@ -538,6 +538,8 @@ def test_binned_etag_changes_when_the_image_does(client):
         ("sample_stage-x", "sample_stage-x"),
         ('Motor(name="sample_stage-x")', "sample_stage-x"),
         ("Motor(name='sample_stage-y')", "sample_stage-y"),
+        ('Motor(device_name="stage", name="sample_stage-x")', "sample_stage-x"),
+        ('Motor(prefix="BL01:", name="sample_stage-x")', "sample_stage-x"),
         ("<ophyd_async.epics.motor.Motor object at 0x7f797c058590>", None),
     ],
 )
