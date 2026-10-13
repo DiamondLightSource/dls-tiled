@@ -40,6 +40,20 @@ routers:
 
 Ported from Hiran Wijesinghe's [visr-tiled](https://github.com/hyperrealist/visr-tiled).
 
+## Helm chart
+
+`Charts/tiled` is a generic Helm chart for the image, published on each tag to
+`oci://ghcr.io/diamondlightsource/charts/tiled`. The chart version and appVersion
+are both the git tag, and appVersion is the default image tag.
+
+```bash
+helm install tiled oci://ghcr.io/diamondlightsource/charts/tiled --version X.Y.Z
+```
+
+Plugins are off by default; see the `config.routers` comment in
+`Charts/tiled/values.yaml`. The `TILED_SINGLE_USER_API_KEY` environment variable
+is read from the optional secret `tiled-secrets`.
+
 ## Logging
 
 tiled's default logging config has no handler for the plugin loggers, so their
