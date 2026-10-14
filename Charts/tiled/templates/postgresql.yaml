@@ -1,0 +1,82 @@
+{{- with .Values.postgresql }}
+{{- if .enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tiled.fullname" $ }}-postgresql
+  labels:
+    {{- include "tiled.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+spec:
+  clusterIP: None
+  ports:
+    - port: 5432
+      targetPort: postgresql
+      name: postgresql
+  selector:
+    {{- include "tiled.selectorLabels" $ | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "tiled.fullname" $ }}-postgresql
+  labels:
+    {{- include "tiled.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+spec:
+  replicas: 1
+  serviceName: {{ include "tiled.fullname" $ }}-postgresql
+  selector:
+    matchLabels:
+      {{- include "tiled.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: postgresql
+  template:
+    metadata:
+      labels:
+        {{- include "tiled.labels" $ | nindent 8 }}
+        app.kubernetes.io/component: postgresql
+    spec:
+      securityContext:
+        {{- toYaml .podSecurityContext | nindent 8 }}
+      containers:
+        - name: postgresql
+          image: "{{ .image.repository }}:{{ .image.tag }}"
+          imagePullPolicy: {{ .image.pullPolicy }}
+          securityContext:
+            {{- toYaml .securityContext | nindent 12 }}
+          env:
+            # The image's entrypoint creates this superuser and database on first start
+            - name: POSTGRES_USER
+              value: {{ .user | quote }}
+            - name: POSTGRES_DB
+              value: {{ .database | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  {{- toYaml .passwordSecret | nindent 18 }}
+          ports:
+            - name: postgresql
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, {{ .user | quote }}]
+          resources:
+            {{- toYaml .resources | nindent 12 }}
+          volumeMounts:
+            # postgres 18+ keeps PGDATA in a versioned subdirectory of this
+            - name: data
+              mountPath: /var/lib/postgresql
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .storage }}
+{{- end }}
+{{- end }}

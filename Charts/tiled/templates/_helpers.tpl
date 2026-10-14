@@ -72,3 +72,20 @@ Fails rather than truncates, so two beamlines can never collide on one name.
 {{- end }}
 {{- $name }}
 {{- end }}
+
+{{/*
+libpq-style connection env for the bundled postgres, used by the init container
+and the tiled config, e.g. postgresql://$PGUSER:$PGPASSWORD@$PGHOST/$PGDATABASE
+*/}}
+{{- define "tiled.postgresqlEnv" -}}
+- name: PGHOST
+  value: {{ include "tiled.fullname" . }}-postgresql
+- name: PGUSER
+  value: {{ .Values.postgresql.user | quote }}
+- name: PGDATABASE
+  value: {{ .Values.postgresql.database | quote }}
+- name: PGPASSWORD
+  valueFrom:
+    secretKeyRef:
+      {{- toYaml .Values.postgresql.passwordSecret | nindent 6 }}
+{{- end }}
