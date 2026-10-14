@@ -227,10 +227,16 @@ def _xyz_order(axes: list, motors: object) -> list[int]:
     return sorted(range(len(axes)), key=lambda i: _AXIS_LETTERS.index(letters[i]))
 
 
-def _bin_edges(centres: numpy.ndarray) -> numpy.ndarray:
-    """Edges halfway between consecutive centres, extended half a step at each end."""
+def _bin_edges(centres: numpy.ndarray, single_width: float = 1.0) -> numpy.ndarray:
+    """Edges halfway between consecutive centres, extended half a step at each end.
+
+    A single centre has no neighbour to take a step from, so its cell is
+    ``single_width`` wide.
+    """
     if len(centres) == 1:
-        return numpy.array([centres[0] - 0.5, centres[0] + 0.5])
+        return numpy.array(
+            [centres[0] - single_width / 2, centres[0] + single_width / 2]
+        )
     mids = (centres[:-1] + centres[1:]) / 2
     first = centres[0] - (centres[1] - centres[0]) / 2
     last = centres[-1] + (centres[-1] - centres[-2]) / 2
@@ -241,9 +247,6 @@ def _bin_edges(centres: numpy.ndarray) -> numpy.ndarray:
 # poll (200 x 200 is about 2.3 MB of JSON), so the caller falls back to the
 # coarse default binning.
 MAX_GRID_CELLS = int(os.getenv("DLS_TILED_VISR_MAX_GRID_CELLS", "40000"))
-# The ViSR plot needs at least three points on each axis, so a scan narrower than
-# that keeps the previous default binning.
-MIN_CELLS_PER_AXIS = 3
 
 
 class ScanGrid(NamedTuple):
@@ -295,13 +298,23 @@ def _grid_from_spec(spec_json: str, motors_json: str) -> ScanGrid | None:
     y_setpoints = numpy.asarray(by_axis[axes[letters.index("y")]], dtype=float)
     xs = numpy.unique(numpy.round(x_setpoints, 9))
     ys = numpy.unique(numpy.round(y_setpoints, 9))
-    if min(len(xs), len(ys)) < MIN_CELLS_PER_AXIS:
-        return None  # a line, or too few cells for the plot's axes
+    if not len(xs) or not len(ys):
+        return None  # a spec with no points
     if len(xs) * len(ys) > min(n_total, MAX_GRID_CELLS):
         return None  # more cells than points: not a grid
+    # An axis with one setpoint (a line scan, or a single point) has no step of
+    # its own, so its cell takes the other axis's step, or 1 if neither has one.
+    step_x = float(numpy.min(numpy.diff(xs))) if len(xs) > 1 else None
+    step_y = float(numpy.min(numpy.diff(ys))) if len(ys) > 1 else None
+    single = step_x or step_y or 1.0
     named = None not in (_axis_name(a) for a in axes)
     return ScanGrid(
-        _bin_edges(xs), _bin_edges(ys), n_total, x_setpoints, y_setpoints, named
+        _bin_edges(xs, single),
+        _bin_edges(ys, single),
+        n_total,
+        x_setpoints,
+        y_setpoints,
+        named,
     )
 
 

@@ -35,8 +35,9 @@ setpoints in the run's start document with `setpoints=true`.
 
 Unless `width`/`height` or a full `xmin`/`xmax`/`ymin`/`ymax` range are given,
 the bins follow the scan's setpoint grid from its spec (one cell per setpoint,
-fixed from the first poll), provided the spec is a grid of at least 3×3 and the
-recorded positions lie on it. Positions that are off the grid by a constant
+fixed from the first poll), provided the spec lays its points out on a grid
+(any size, down to a line or a single point) and the recorded positions lie on
+it. Positions that are off the grid by a constant
 amount per axis (as fly scans currently record them) are first shifted onto it
 by the median of each point's position minus its setpoint, and the shift is
 returned as `position_offset`. Otherwise numpy's default 10×10 over the data.

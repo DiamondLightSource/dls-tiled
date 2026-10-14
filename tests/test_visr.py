@@ -332,10 +332,28 @@ def test_grid_is_none_when_it_has_more_cells_than_the_cap(monkeypatch):
     visr._grid_from_spec.cache_clear()
 
 
-def test_grid_is_none_for_a_scan_narrower_than_three_setpoints():
-    # a line, and a 2-wide grid: too few points on an axis for the UI's plot axes
-    assert _grid_or_none(Line("y", 0, 2, 3) * Line("x", 3, 3, 1)) is None
-    assert _grid_or_none(Line("y", 0, 2, 3) * Line("x", 0, 1, 2)) is None
+def test_grid_of_a_two_by_two_scan():
+    x_edges, y_edges, n_total, *_ = _grid(Line("y", 0, 2, 2) * ~Line("x", 0, 2, 2))
+
+    assert x_edges.tolist() == [-1.0, 1.0, 3.0]
+    assert y_edges.tolist() == [-1.0, 1.0, 3.0]
+    assert n_total == 4
+
+
+def test_grid_of_a_line_takes_its_cell_height_from_the_scan_step():
+    # one setpoint in y: no step of its own, so its cell is as tall as x's step
+    x_edges, y_edges, *_ = _grid(Line("y", 5, 5, 1) * Line("x", 0, 2, 3))
+
+    assert x_edges.tolist() == [-0.5, 0.5, 1.5, 2.5]
+    assert y_edges.tolist() == [4.5, 5.5]
+
+
+def test_grid_of_a_single_point():
+    x_edges, y_edges, n_total, *_ = _grid(Line("y", 1, 1, 1) * Line("x", 2, 2, 1))
+
+    assert x_edges.tolist() == [1.5, 2.5]
+    assert y_edges.tolist() == [0.5, 1.5]
+    assert n_total == 1
 
 
 def write_grid_scan(client, uid, n_points):
@@ -390,6 +408,72 @@ def test_binned_without_a_spec_still_reports_no_total(client):
     body = client.context.http_client.get("/api/v1/binned/scan").json()
 
     assert body["n_total"] is None
+
+
+def write_small_scan(client, uid, spec, x, y, x_shift=0.0, y_shift=0.0):
+    """A run with this spec and these recorded positions, values 0, 1, 2..."""
+    write_points(
+        client,
+        uid,
+        numpy.asarray(x, dtype=float) + x_shift,
+        numpy.asarray(y, dtype=float) + y_shift,
+        metadata={"start": {"spec": spec.serialize()}},
+    )
+
+
+def test_binned_shows_a_two_by_two_scan_on_its_grid(client):
+    write_small_scan(
+        client,
+        "two",
+        Line("y", 0, 2, 2) * ~Line("x", 0, 2, 2),
+        [0, 2, 2, 0],
+        [0, 0, 2, 2],
+    )
+
+    body = client.context.http_client.get("/api/v1/binned/two").json()
+
+    # snaked: the second row runs back, so its first point is on the right
+    assert body["RedTotal"] == [[0.0, 1.0], [3.0, 2.0]]
+    assert body["x_limits"] == [-1.0, 1.0, 3.0]
+
+
+def test_binned_shows_a_single_point_as_one_cell(client):
+    write_small_scan(client, "one", Line("y", 1, 1, 1) * Line("x", 2, 2, 1), [2], [1])
+
+    body = client.context.http_client.get("/api/v1/binned/one").json()
+
+    assert body["RedTotal"] == [[0.0]]
+    assert (body["x_limits"], body["y_limits"]) == ([1.5, 2.5], [0.5, 1.5])
+
+
+def test_binned_shows_a_line_scan_as_one_row(client):
+    write_small_scan(
+        client, "line", Line("y", 5, 5, 1) * Line("x", 0, 2, 3), [0, 1, 2], [5, 5, 5]
+    )
+
+    body = client.context.http_client.get("/api/v1/binned/line").json()
+
+    assert body["RedTotal"] == [[0.0, 1.0, 2.0]]
+    assert body["y_limits"] == [4.5, 5.5]
+
+
+def test_binned_keeps_the_default_binning_for_an_offset_line_scan(client):
+    # a single row never wraps, so an offset can't be told from a frame gained
+    # or lost at the start: no offset is taken, and the default binning stays
+    write_small_scan(
+        client,
+        "flyline",
+        Line("y", 5, 5, 1) * Line("x", 0, 2, 3),
+        [0, 1, 2],
+        [5, 5, 5],
+        x_shift=1.0,
+        y_shift=10.4,
+    )
+
+    body = client.context.http_client.get("/api/v1/binned/flyline").json()
+
+    assert body["position_offset"] is None
+    assert len(body["RedTotal"]) == 10
 
 
 # --- sharing work between polls ------------------------------------------------------
