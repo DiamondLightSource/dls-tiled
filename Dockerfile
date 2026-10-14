@@ -1,5 +1,5 @@
 # The upstream tiled release that the runtime image extends
-ARG TILED_VERSION=0.2.18
+ARG TILED_VERSION=0.2.19
 
 # The devcontainer should use the developer target and run as root with podman
 # or docker with user namespaces.
