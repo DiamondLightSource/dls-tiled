@@ -24,6 +24,11 @@ config:
         writable_storage: "/storage/data"
         init_if_not_exists: true
 
+# Restart the tiled pods when their ConfigMap changes, by putting a checksum of
+# it in a pod annotation. See
+# https://helm.sh/docs/howto/charts_tips_and_tricks/#automatically-roll-deployments
+rollOnConfigChange: true
+
 # This will set the replicaset count more information can be found here: https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/
 replicaCount: 1
 
