@@ -889,6 +889,30 @@ async def load_points(
         readbacks = readbacks[:, mask]
         data = {channel: d[mask] for channel, d in data.items()}
 
+    # A point with no position on x or y (NaN: a run that only moved x has no
+    # y readings, say) can't be placed in any bin, and numpy's default binning
+    # can't take a range from it. Drop such points; if that leaves none of a
+    # run's points, there is nothing to show, so say why.
+    positioned = numpy.isfinite(readbacks[x_dim_index]) & numpy.isfinite(
+        readbacks[y_dim_index]
+    )
+    if not positioned.all():
+        if not positioned.any():
+            missing = [
+                axis
+                for axis, dim in (("x", x_dim_index), ("y", y_dim_index))
+                if not numpy.isfinite(readbacks[dim]).any()
+            ]
+            raise HTTPException(
+                status_code=HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"Run '{uid}' has no recorded "
+                    f"{' or '.join(missing) or 'x and y'} positions to bin by"
+                ),
+            )
+        readbacks = readbacks[:, positioned]
+        data = {channel: d[positioned] for channel, d in data.items()}
+
     assert isinstance(red_total, (H5Dataset, numpy.ndarray))
     logger.debug(
         "readbacks shape %s, red_total shape %s (sliced=%s)",

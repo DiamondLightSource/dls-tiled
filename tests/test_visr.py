@@ -476,6 +476,28 @@ def test_binned_keeps_the_default_binning_for_an_offset_line_scan(client):
     assert len(body["RedTotal"]) == 10
 
 
+def test_binned_leaves_out_points_without_a_position(client):
+    # no spec, so the default binning, whose range a NaN used to break
+    write_points(client, "gap", [0.0, 1.0, numpy.nan, 1.0], [0.0, 0.0, 1.0, 1.0])
+
+    body = client.context.http_client.get(
+        "/api/v1/binned/gap", params={"width": 2, "height": 2}
+    ).json()
+
+    assert body["RedTotal"] == [[0.0, 1.0], [None, 3.0]]
+    assert body["n_points"] == 3
+
+
+def test_binned_answers_422_for_a_run_with_no_y_positions(client):
+    # an x-only run: y is filled with NaN, which used to fail with a 500
+    write_points(client, "xonly", [0.0, 1.1, 2.2], [numpy.nan] * 3)
+
+    response = client.context.http_client.get("/api/v1/binned/xonly")
+
+    assert response.status_code == 422
+    assert "no recorded y positions" in response.json()["detail"]
+
+
 # --- sharing work between polls ------------------------------------------------------
 
 
