@@ -2,10 +2,9 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
-# One tiled Deployment and Service per beamline. Each pod gets TILED_BEAMLINE=<name>,
-# and may add its own securityContext (supplementalGroups for POSIX access to the
-# beamline data), livenessProbe, readinessProbe, extraEnvVars, volumes and
-# volumeMounts, which are merged with or appended to the global values below, e.g.
+# One tiled Deployment and Service per beamline. Each may add its own
+# securityContext (supplementalGroups for POSIX access to the beamline data),
+# livenessProbe, readinessProbe, extraEnvVars, volumes and volumeMounts, which are merged with or appended to the global values below, e.g.
 #   - name: p51
 #     securityContext:
 #       supplementalGroups: [12345]
@@ -26,15 +25,14 @@ config:
   #   - dls_tiled.visr:visr_router
   authentication:
     allow_anonymous_access: false
-  # Envoy sends /.../<beamline>/... to that beamline's pod, so each pod serves its
-  # tree at /<beamline>. Use a per-beamline catalog in production, e.g.
-  # uri: postgresql://.../$TILED_BEAMLINE
+  # Envoy sends /.../<beamline>/... to that beamline's pod, unchanged, so the
+  # beamline is the first node under the tree's root.
   # To let tokens issued by one pod verify on the others (all /api/v1/auth/* traffic
   # goes to envoy.defaultBeamline), share the signing keys, e.g.
   #   secret_keys: ["$TILED_SECRET_KEY"]
   # with TILED_SECRET_KEY added to extraEnvVars from a Secret.
   trees:
-    - path: /$TILED_BEAMLINE
+    - path: /
       tree: catalog
       args:
         uri: "sqlite:////storage/catalog.db"

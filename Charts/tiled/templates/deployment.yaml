@@ -67,11 +67,8 @@ spec:
           volumeMounts:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          env:
-            # Lets the tiled config refer to the beamline, e.g. a tree at /$TILED_BEAMLINE
-            - name: TILED_BEAMLINE
-              value: {{ .name | quote }}
           {{- with concat $.Values.extraEnvVars (.extraEnvVars | default list) }}
+          env:
             {{- toYaml . | nindent 12 }}
           {{- end }}
       volumes:
