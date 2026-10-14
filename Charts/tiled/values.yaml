@@ -9,12 +9,6 @@
 #   - name: p51
 #     securityContext:
 #       supplementalGroups: [12345]
-#     volumes:
-#       - name: data
-#         hostPath: {path: /dls/p51/data}
-#     volumeMounts:
-#       - name: data
-#         mountPath: /dls/p51/data
 beamlines:
   - name: default
 
@@ -27,8 +21,9 @@ config:
   authentication:
     allow_anonymous_access: false
   # Envoy sends /.../<beamline>/... to that beamline's pod, so each pod serves its
-  # tree at /<beamline>. Use a per-beamline catalog in production, e.g.
-  # uri: postgresql://.../$TILED_BEAMLINE
+  # tree at /<beamline>. Every pod uses the same postgres catalog, whose uri
+  # (postgresql://user:password@host/database) is TILED_CATALOG_URI, from
+  # extraEnvVars.
   # To let tokens issued by one pod verify on the others (all /api/v1/auth/* traffic
   # goes to envoy.defaultBeamline), share the signing keys, e.g.
   #   secret_keys: ["$TILED_SECRET_KEY"]
@@ -37,7 +32,7 @@ config:
     - path: /$TILED_BEAMLINE
       tree: catalog
       args:
-        uri: "sqlite:////storage/catalog.db"
+        uri: "$TILED_CATALOG_URI"
         writable_storage: "/storage/data"
         init_if_not_exists: true
 
@@ -207,14 +202,22 @@ autoscaling:
   targetCPUUtilizationPercentage: 80
   # targetMemoryUtilizationPercentage: 80
 
-# Additional volumes on the output Deployment definition.
-volumes: []
+# Additional volumes on the output Deployment definition. Every beamline pod
+# mounts all of /dls, and reads what its securityContext lets it.
+volumes:
+  - name: dls
+    hostPath:
+      path: /dls
+      type: Directory
 
 
 # Additional volumeMounts on the output Deployment definition.
 volumeMounts:
   - name: config
     mountPath: "/deploy/config"
+    readOnly: true
+  - name: dls
+    mountPath: /dls
     readOnly: true
 
 nodeSelector: {}
@@ -224,9 +227,14 @@ tolerations: []
 affinity: {}
 
 
-# Additional envVars to mount to the pod. The API key secret is optional so the
-# chart installs without it; create a secret named tiled-secrets to set the key.
+# Additional envVars to mount to the pod, from a secret named tiled-secrets. The
+# API key is optional, the catalog uri is required.
 extraEnvVars:
+- name: TILED_CATALOG_URI
+  valueFrom:
+    secretKeyRef:
+      name: tiled-secrets
+      key: TILED_CATALOG_URI
 - name: TILED_SINGLE_USER_API_KEY
   valueFrom:
     secretKeyRef:
