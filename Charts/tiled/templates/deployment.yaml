@@ -3,7 +3,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "tiled.fullname" $ }}-{{ .name }}
+  name: {{ include "tiled.beamlineFullname" (dict "root" $ "beamline" .) }}
   labels:
     {{- include "tiled.labels" $ | nindent 4 }}
     tiled.io/beamline: {{ .name }}
@@ -55,7 +55,7 @@ spec:
           {{- end }}
           ports:
             - name: http
-              containerPort: {{ .port | default $.Values.service.port }}
+              containerPort: 8000
               protocol: TCP
           livenessProbe:
             {{- toYaml (merge (.livenessProbe | default dict) $.Values.livenessProbe) | nindent 12 }}
@@ -63,12 +63,15 @@ spec:
             {{- toYaml (merge (.readinessProbe | default dict) $.Values.readinessProbe) | nindent 12 }}
           resources:
             {{- toYaml $.Values.resources | nindent 12 }}
+          {{- with concat $.Values.volumeMounts (.volumeMounts | default list) }}
           volumeMounts:
-          {{- with $.Values.volumeMounts }}
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with $.Values.extraEnvVars }}
           env:
+            # Lets the tiled config refer to the beamline, e.g. a tree at /$TILED_BEAMLINE
+            - name: TILED_BEAMLINE
+              value: {{ .name | quote }}
+          {{- with concat $.Values.extraEnvVars (.extraEnvVars | default list) }}
             {{- toYaml . | nindent 12 }}
           {{- end }}
       volumes:
@@ -77,7 +80,7 @@ spec:
             sources:
               - configMap:
                   name: {{ include "tiled.fullname" $ }}-config
-      {{- with $.Values.volumes }}
+      {{- with concat $.Values.volumes (.volumes | default list) }}
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with $.Values.nodeSelector }}

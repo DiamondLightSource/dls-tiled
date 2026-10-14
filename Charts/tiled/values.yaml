@@ -2,6 +2,19 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 
+# One tiled Deployment and Service per beamline. Each pod gets TILED_BEAMLINE=<name>,
+# and may add its own securityContext (supplementalGroups for POSIX access to the
+# beamline data), livenessProbe, readinessProbe, extraEnvVars, volumes and
+# volumeMounts, which are merged with or appended to the global values below, e.g.
+#   - name: p51
+#     securityContext:
+#       supplementalGroups: [12345]
+#     volumes:
+#       - name: data
+#         hostPath: {path: /dls/p51/data}
+#     volumeMounts:
+#       - name: data
+#         mountPath: /dls/p51/data
 beamlines:
   - name: default
 
@@ -13,8 +26,15 @@ config:
   #   - dls_tiled.visr:visr_router
   authentication:
     allow_anonymous_access: false
+  # Envoy sends /.../<beamline>/... to that beamline's pod, so each pod serves its
+  # tree at /<beamline>. Use a per-beamline catalog in production, e.g.
+  # uri: postgresql://.../$TILED_BEAMLINE
+  # To let tokens issued by one pod verify on the others (all /api/v1/auth/* traffic
+  # goes to envoy.defaultBeamline), share the signing keys, e.g.
+  #   secret_keys: ["$TILED_SECRET_KEY"]
+  # with TILED_SECRET_KEY added to extraEnvVars from a Secret.
   trees:
-    - path: /
+    - path: /$TILED_BEAMLINE
       tree: catalog
       args:
         uri: "sqlite:////storage/catalog.db"
@@ -84,6 +104,7 @@ service:
   # This sets the service type more information can be found here: https://kubernetes.io/docs/concepts/services-networking/service/#publishing-services-service-types
   type: ClusterIP
   # This sets the ports more information can be found here: https://kubernetes.io/docs/concepts/services-networking/service/#field-spec-ports
+  # The Service port; tiled itself always listens on 8000 (the image CMD)
   port: 8000
 
 # This block is for setting up the ingress for more information can be found here: https://kubernetes.io/docs/concepts/services-networking/ingress/
@@ -98,18 +119,15 @@ ingress:
   annotations: {}
     # kubernetes.io/tls-acme: "true"
   hosts:
-    - host: chart-example.local
-      paths:
-        - path: /
-          pathType: ImplementationSpecific
+    - chart-example.local
   tls: []
   #  - secretName: chart-example-tls
   #    hosts:
   #      - chart-example.local
 
 # Envoy proxy that performs regex-based routing to the per-beamline
-# Services, matching requests where the beamline name appears as a path
-# segment anywhere in the URL (e.g. /api/v1/search/p51/cm44254/cm44254-1/data) and
+# Services, matching requests where the beamline name is the first segment of
+# the tiled path (e.g. /api/v1/search/p51/cm44254/cm44254-1/data) and
 # forwarding the complete, unmodified request to that beamline's own
 # Service. This exists because the Ingress resource itself can't do regex
 # path matching under the cluster's Kyverno policy (see ingress.annotations
@@ -117,13 +135,26 @@ ingress:
 # regex (e.g. the UI at "/") falls through to the defaultBeamline's Service.
 envoy:
   enabled: true
-  replicaCount: 1
+  # Envoy is in front of every beamline, so run more than one; a
+  # PodDisruptionBudget is added when this is above 1
+  replicaCount: 2
   image:
     repository: envoyproxy/envoy
-    tag: v1.29-latest
+    tag: v1.39.4
     pullPolicy: IfNotPresent
   listenerPort: 10000
+  # Bound to 127.0.0.1, use with kubectl exec
   adminPort: 9901
+  # The tiled endpoints, before the tiled path, that envoy routes on. Add any
+  # plugin routers enabled in config.routers (mounted at /custom and /api/v1).
+  pathPrefixes:
+    - api/v1/(search|distinct|metadata|register|data_source|revisions)
+    - api/v1/(array|ragged)/(block|full)
+    - api/v1/(table/partition|table/full|container/full|node/full)
+    - api/v1/(awkward/buffers|awkward/full|asset/bytes|asset/manifest)
+    - api/v1/stream/(single|close)
+    - (api/v1|custom)/binned
+    - zarr/v[23]
   # Name of the entry in .Values.beamlines that catch-all (unmatched) requests
   # are routed to.
   defaultBeamline: default
@@ -131,11 +162,9 @@ envoy:
     type: ClusterIP
     port: 8080
   resources: {}
-  # Run as a fixed non-root user and bypass the image's default
-  # docker-entrypoint.sh (which chowns /dev/stdout and /dev/stderr while
-  # dropping from root to a non-root user) via `command: [envoy]` in the
-  # Deployment. That chown fails under the cluster's restricted pod
-  # permissions, so envoy is started directly as this user instead.
+  # Run as a fixed non-root user. The Deployment starts envoy directly with
+  # `command: [envoy]`, skipping the image's docker-entrypoint.sh, which only
+  # matters when starting as root.
   podSecurityContext:
     runAsNonRoot: true
     runAsUser: 1000

@@ -60,3 +60,15 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Name of a beamline's Deployment and Service. Called with (dict "root" $ "beamline" .).
+Fails rather than truncates, so two beamlines can never collide on one name.
+*/}}
+{{- define "tiled.beamlineFullname" -}}
+{{- $name := printf "%s-%s" (include "tiled.fullname" .root) .beamline.name }}
+{{- if gt (len $name) 63 }}
+{{- fail (printf "%q is longer than 63 characters, shorten the release or beamline name" $name) }}
+{{- end }}
+{{- $name }}
+{{- end }}

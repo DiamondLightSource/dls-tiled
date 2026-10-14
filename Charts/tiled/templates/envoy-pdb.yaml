@@ -1,0 +1,15 @@
+{{- if and .Values.envoy.enabled (gt (int .Values.envoy.replicaCount) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tiled.fullname" . }}-envoy
+  labels:
+    {{- include "tiled.labels" . | nindent 4 }}
+    app.kubernetes.io/component: envoy-proxy
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "tiled.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: envoy-proxy
+{{- end }}
