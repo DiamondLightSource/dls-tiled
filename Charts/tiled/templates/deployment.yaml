@@ -39,6 +39,23 @@ spec:
       {{- $beamlineSC := .securityContext | default dict }}
       securityContext:
         {{- toYaml (merge (pick $beamlineSC "supplementalGroups") $.Values.podSecurityContext) | nindent 8 }}
+      {{- if $.Values.postgresql.enabled }}
+      # All beamlines share one catalog database, which postgres creates on
+      # first start. Make its tables, retrying until postgres is up and if
+      # another beamline's pod is doing the same. A no-op once done.
+      initContainers:
+        - name: init-catalog
+          image: "{{ $.Values.image.repository }}:{{ $.Values.image.tag | default $.Chart.AppVersion }}"
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml (merge (omit $beamlineSC "supplementalGroups") $.Values.securityContext) | nindent 12 }}
+          command:
+            - sh
+            - -c
+            - until tiled catalog init --if-not-exists "postgresql://$PGUSER:$PGPASSWORD@$PGHOST/$PGDATABASE"; do sleep 2; done
+          env:
+            {{- include "tiled.postgresqlEnv" $ | nindent 12 }}
+      {{- end }}
       containers:
         - name: {{ $.Chart.Name }}
           securityContext:
@@ -67,9 +84,15 @@ spec:
           volumeMounts:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with concat $.Values.extraEnvVars (.extraEnvVars | default list) }}
+          {{- $env := concat $.Values.extraEnvVars (.extraEnvVars | default list) }}
+          {{- if or $env $.Values.postgresql.enabled }}
           env:
+            {{- if $.Values.postgresql.enabled }}
+            {{- include "tiled.postgresqlEnv" $ | nindent 12 }}
+            {{- end }}
+            {{- with $env }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
       volumes:
         - name: config
