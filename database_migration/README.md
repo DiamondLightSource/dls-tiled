@@ -131,16 +131,17 @@ forward the Postgres port first. Leave this running in its own terminal:
 kubectl port-forward -n $NS pod/$POD 5432:5432
 ```
 
-In another terminal, from a Python environment with `tiled[server]` installed:
+In another terminal (uv installs the script's dependencies, pinned to the
+tiled version in the runtime image):
 
 ```bash
 URI=postgresql://postgres:<password>@localhost:5432/tiled
 
 # Preview: prints what would move, changes nothing
-python migrate_node_structure.py $URI --dry-run
+uv run --script migrate_node_structure.py $URI --dry-run
 
 # Upgrade the tiled schema (to --revision, default head), then move the runs
-python migrate_node_structure.py $URI --revision head
+uv run --script migrate_node_structure.py $URI --revision head
 ```
 
 The dry run only works if the database is already at tiled schema revision

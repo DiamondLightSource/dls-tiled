@@ -1,3 +1,8 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tiled[server]==0.2.18"]
+# ///
 """Move runs from the flat catalog layout into the beamline/proposal/session tree.
 
 Before:  root/<run uid>
@@ -21,7 +26,7 @@ rerun: anything already moved is no longer a child of the root.
 Postgres only.
 
 Example:
-    python database_migration/migrate_node_structure.py \\
+    uv run --script database_migration/migrate_node_structure.py \\
         postgresql://user:pass@host:5432/tiled --revision head --dry-run
 """
 

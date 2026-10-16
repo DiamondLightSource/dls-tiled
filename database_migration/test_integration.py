@@ -1,12 +1,17 @@
 """Migrate a real tiled dump and read it back through dls-tiled, Keycloak and OPA.
 
-Needs docker compose and a custom-format dump of the tiled database, e.g.
-backup/tiled.dump from README step 2:
+Needs docker compose and uv. Runs against a small seeded catalog in the old
+flat layout (what CI does):
+
+    uv run pytest database_migration/test_integration.py
+
+or against a custom-format dump of the real database, e.g. backup/tiled.dump
+from README step 2:
 
     PROD_DUMP=backup/tiled.dump uv run pytest database_migration/test_integration.py
 
-Skipped without PROD_DUMP. The stack in integration/compose.yaml is torn down
-afterwards; set KEEP_STACK=1 to leave it up for poking at.
+The stack in integration/compose.yaml is torn down afterwards; set KEEP_STACK=1
+to leave it up for poking at.
 
 What it checks, for every run the migration moves:
   - it is at <beamline>/<proposal>/<session>/<run> with its metadata unchanged
@@ -33,17 +38,24 @@ URI = "postgresql://postgres:postgres@localhost:5433/tiled"
 KEYCLOAK = "http://localhost:8081"
 TILED = "http://localhost:8407/api/v1"
 DUMP = os.environ.get("PROD_DUMP")
-
-pytestmark = pytest.mark.skipif(not DUMP, reason="set PROD_DUMP to a tiled pg_dump")
+# Runs at the root of a catalog in the old layout: (key, beamline, session).
+# The last two have nothing to place them by, so the migration skips them.
+SEED_RUNS = [
+    ("run-1", "i22", "cm12345-1"),
+    ("run-2", "i22", "cm12345-1"),
+    ("run-3", "i22", "cm12345-2"),
+    ("run-4", "p45", "mx67890-3"),
+    ("no-session", "i22", None),
+    ("bad-session", "i22", "not-a-session"),
+]
 
 
 def compose(*args: str, **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run([*COMPOSE, *args], check=True, **kwargs)
 
 
-def sql(query: str):
-    """Run a query that returns one JSON value and decode it."""
-    out = compose(
+def psql(query: str) -> str:
+    return compose(
         "exec",
         "-T",
         "postgres",
@@ -57,7 +69,33 @@ def sql(query: str):
         capture_output=True,
         text=True,
     ).stdout
-    return json.loads(out)
+
+
+def sql(query: str):
+    """Run a query that returns one JSON value and decode it."""
+    return json.loads(psql(query))
+
+
+def seed() -> None:
+    """A fresh catalog with SEED_RUNS at the root, tagged with the bare numeric
+    session id the old policy used, each with a tagged and an untagged child."""
+    subprocess.run([sys.executable, "-m", "tiled", "catalog", "init", URI], check=True)
+    runs = []
+    for i, (key, beamline, session) in enumerate(SEED_RUNS, start=1):
+        start = {"uid": key, "instrument": beamline}
+        if session:
+            start["instrument_session"] = session
+        metadata = json.dumps({"start": start})
+        blob = json.dumps({"tags": [str(i)]})
+        runs.append(f"(0, '{key}', 'container', '{metadata}', '[]', '{blob}')")
+    columns = "(parent, key, structure_family, metadata, specs, access_blob)"
+    psql(f"INSERT INTO nodes {columns} VALUES {', '.join(runs)}")
+    # Separate statements, so the closure trigger has the runs' rows to join.
+    for child, blob in (("primary", "access_blob"), ("public", "'{}'")):
+        psql(
+            f"INSERT INTO nodes {columns} SELECT id, '{child}', 'container', "
+            f"'{{}}', '[]', {blob} FROM nodes WHERE parent = 0"
+        )
 
 
 def snapshot() -> list[dict]:
@@ -188,21 +226,25 @@ def migrated():
             "tiled",
         )
         compose("exec", "-T", "postgres", "createdb", "-U", "postgres", "tiled")
-        with open(DUMP, "rb") as f:
-            # Production roles don't exist here, so drop ownership and grants.
-            compose(
-                "exec",
-                "-T",
-                "postgres",
-                "pg_restore",
-                "-U",
-                "postgres",
-                "-d",
-                "tiled",
-                "--no-owner",
-                "--no-acl",
-                stdin=f,
-            )
+        if DUMP:
+            with open(DUMP, "rb") as f:
+                # Production roles don't exist here, so drop ownership and grants.
+                compose(
+                    "exec",
+                    "-T",
+                    "postgres",
+                    "pg_restore",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "tiled",
+                    "--no-owner",
+                    "--no-acl",
+                    "--exit-on-error",
+                    stdin=f,
+                )
+        else:
+            seed()
         # Upgrade first so the snapshot can count subtrees with nodes_closure.
         subprocess.run(
             [sys.executable, "-m", "tiled", "catalog", "upgrade-database", URI],
@@ -214,8 +256,9 @@ def migrated():
         )
         assert moves, "the dump has no runs to move"
 
+        # The way the README runs it, with the script's own pinned dependencies.
         subprocess.run(
-            [sys.executable, str(HERE / "migrate_node_structure.py"), URI],
+            ["uv", "run", "--script", str(HERE / "migrate_node_structure.py"), URI],
             check=True,
         )
 

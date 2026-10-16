@@ -1,3 +1,8 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
 """Back up a Postgres pod in Kubernetes, or add a read-only role to it.
 
 Every command runs inside the pod with `kubectl exec`, so the pod's own
@@ -6,11 +11,13 @@ installing locally. Dumps are written to this machine.
 
 Examples:
     # Write globals.sql plus one <database>.dump per database into ./backup
-    python postgres_tools.py --pod tiled-postgres-0 --namespace tiled dump backup
+    uv run --script postgres_tools.py --pod tiled-postgres-0 --namespace tiled \\
+        dump backup
 
     # Create a role that can read every database but change nothing.
     # Asks for the new role's password.
-    python postgres_tools.py --pod tiled-postgres-0 --namespace tiled readonly-role
+    uv run --script postgres_tools.py --pod tiled-postgres-0 --namespace tiled \\
+        readonly-role
 
 Restore (roles first on a fresh server, then each database). Scale tiled to
 zero first, or it creates the schema in the empty database and the restore
@@ -18,7 +25,8 @@ fails with "already exists" errors:
     kubectl scale -n NS deploy/TILED --replicas=0
     kubectl exec -i -n NS POD -- psql -U postgres -d postgres < backup/globals.sql
     kubectl exec -n NS POD -- createdb -U postgres tiled
-    kubectl exec -i -n NS POD -- pg_restore -U postgres -d tiled --exit-on-error < backup/tiled.dump
+    kubectl exec -i -n NS POD -- pg_restore -U postgres -d tiled --exit-on-error \\
+        < backup/tiled.dump
     kubectl scale -n NS deploy/TILED --replicas=1
 """
 
