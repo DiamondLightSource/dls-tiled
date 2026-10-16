@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import HTTPException
-from pydantic import HttpUrl, SecretStr, ValidationError
+from pydantic import HttpUrl, SecretStr
 from tiled.access_control import access_policies
 from tiled.access_control.access_policies import ALL_ACCESS, NO_ACCESS
 from tiled.config import parse_configs
@@ -20,8 +20,8 @@ from dls_tiled.policy import (
 
 OPA = "http://opa.example:8181/v1/data/"
 AUDIENCE = "tiled-audience"
-BLOB_TAG = '{"proposal": 1234, "visit": 5, "beamline": "i22"}'
-BLOB_FIELDS = {"proposal": 1234, "visit": 5, "beamline": "i22"}
+BLOB_TAG = '{"proposal": "cm1234", "visit": 5, "beamline": "i22"}'
+BLOB_FIELDS = {"proposal": "cm1234", "visit": 5, "beamline": "i22"}
 
 # async tests run on anyio's pytest plugin, which ships with tiled's httpx
 pytestmark = pytest.mark.anyio
@@ -89,6 +89,23 @@ def test_build_input_with_diamond_access_blob(policy, user):
     assert body["input"] == {"audience": AUDIENCE, "token": "the-token", **BLOB_FIELDS}
 
 
+@pytest.mark.parametrize(
+    "tag, fields",
+    [
+        ('{"beamline": "i22"}', {"beamline": "i22"}),
+        (
+            '{"beamline": "i22", "proposal": "cm1234"}',
+            {"beamline": "i22", "proposal": "cm1234"},
+        ),
+    ],
+)
+def test_build_input_with_container_blob(policy, user, tag, fields):
+    # Beamline and proposal containers have no visit; absent fields aren't sent.
+    body = json.loads(policy.build_input(user, None, set(), {"tags": [tag]}))
+
+    assert body["input"] == {"audience": AUDIENCE, "token": "the-token", **fields}
+
+
 def test_build_input_with_session_int(policy, user):
     body = json.loads(policy.build_input(user, None, set(), {"tags": ["98765"]}))
 
@@ -115,9 +132,43 @@ def test_build_input_ignores_blob_without_tags(policy, user, blob):
     assert body["input"] == {"audience": AUDIENCE, "token": "the-token"}
 
 
-def test_build_input_rejects_unparseable_tag(policy, user):
-    with pytest.raises(ValidationError):
-        policy.build_input(user, None, set(), {"tags": ['{"proposal": 1}']})
+@pytest.mark.parametrize(
+    "tag, fields",
+    [
+        ("beamline:i22", {"beamline": "i22"}),
+        ("beamline:i22,proposal:12345", {"beamline": "i22", "proposal": "12345"}),
+        (
+            "beamline:i22,proposal:12345,session:12345-1",
+            {"beamline": "i22", "proposal": "12345", "session": "12345-1"},
+        ),
+        ("beamline:i22,unknown:x", {"beamline": "i22"}),
+    ],
+)
+def test_build_input_with_composite_tag(policy, user, tag, fields):
+    body = json.loads(policy.build_input(user, None, set(), {"tags": [tag]}))
+
+    assert body["input"] == {"audience": AUDIENCE, "token": "the-token", **fields}
+
+
+def test_build_input_ignores_unparseable_tag(policy, user):
+    blob = {"tags": ['{"proposal": 1}']}
+
+    body = json.loads(policy.build_input(user, None, set(), blob))
+
+    assert body["input"] == {"audience": AUDIENCE, "token": "the-token"}
+
+
+async def test_allowed_scopes_on_migrated_node(policy, user, opa):
+    # tiled sends a node's own tag when reading it; this used to raise.
+    opa.responses[f"{OPA}tiled/scopes"] = {"result": ["read:metadata"]}
+    node = SimpleNamespace(
+        access_blob={"tags": ["beamline:i22,proposal:12345,session:12345-1"]}
+    )
+
+    scopes = await policy.allowed_scopes(node, user, None, set())
+
+    assert scopes == {"read:metadata"}
+    assert opa.requests[0][1]["input"]["session"] == "12345-1"
 
 
 def test_build_input_omits_token_when_absent(policy):

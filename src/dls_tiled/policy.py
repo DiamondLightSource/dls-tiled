@@ -8,7 +8,7 @@ import json
 import logging
 
 from fastapi import HTTPException
-from pydantic import BaseModel, HttpUrl, TypeAdapter
+from pydantic import BaseModel, HttpUrl, TypeAdapter, ValidationError
 from starlette.status import (
     HTTP_401_UNAUTHORIZED,
 )
@@ -27,9 +27,40 @@ logger = logging.getLogger(__name__)
 
 
 class DiamondAccessBlob(BaseModel):
-    proposal: int
-    visit: int
+    """What blueapi asks for when creating a node at each level of the tree.
+
+    beamline alone for a beamline node, plus proposal for a proposal node,
+    plus visit for a session node.
+    """
+
     beamline: str
+    # The full proposal code, e.g. "cm12345" - tiled.rego strips the leading
+    # letters itself where it needs the bare number.
+    proposal: str | None = None
+    visit: int | None = None
+
+
+# Maps a composite access tag's "key" (as produced by tiled.rego's
+# beamline_tag/proposal_tag/session_tag, e.g.
+# "beamline:i22,proposal:12345,session:12345-1") to the corresponding OPA
+# input field. All of these are strings on an existing node's tag - "session"
+# here is the "12345-1" proposal-visit pair, not the internal numeric session
+# id used by modify_session.
+_TAG_KEY_TO_INPUT_FIELD = {
+    "beamline": "beamline",
+    "proposal": "proposal",
+    "session": "session",
+}
+
+
+def _parse_composite_tag(tag: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for part in tag.split(","):
+        key, _, value = part.partition(":")
+        field = _TAG_KEY_TO_INPUT_FIELD.get(key)
+        if field is not None:
+            fields[field] = value
+    return fields
 
 
 def _check_principal(principal: Principal | None):
@@ -137,9 +168,17 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
             and "tags" in access_blob
             and len(access_blob["tags"]) > 0
         ):
-            blob = self._type_adapter.validate_json(access_blob["tags"][0])
+            tag = access_blob["tags"][0]
+            try:
+                blob = self._type_adapter.validate_json(tag)
+            except ValidationError:
+                # Not a create-request JSON blob - it's a composite tag
+                # already assigned to an existing node (e.g. tiled checking
+                # scopes on a node before reading it).
+                blob = None
+                _input.update(_parse_composite_tag(tag))
             if isinstance(blob, DiamondAccessBlob):
-                _input.update(blob.model_dump())
+                _input.update(blob.model_dump(exclude_none=True))
             elif isinstance(blob, int):
                 _input["session"] = str(blob)
 
