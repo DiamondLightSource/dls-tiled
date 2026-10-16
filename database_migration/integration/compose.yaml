@@ -1,0 +1,60 @@
+# Stack for test_integration.py: a production dump is restored into postgres,
+# migrated, then read back through dls-tiled with real Keycloak tokens and the
+# Diamond OPA policy. Ports: postgres 5433, keycloak 8081, opa 8181, tiled 8407.
+# Modelled on blueapi's tests/system_tests/compose.yaml.
+
+services:
+  postgres:
+    image: docker.io/postgres:16
+    environment:
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: pg_isready -U postgres
+      interval: 2s
+      retries: 30
+    security_opt:
+      - label=disable
+
+  keycloak:
+    image: keycloak/keycloak:26.4
+    environment:
+      - KC_BOOTSTRAP_ADMIN_PASSWORD=admin
+      - KC_BOOTSTRAP_ADMIN_USERNAME=admin
+      - KC_HOSTNAME=http://localhost:8081
+    command: ["start-dev"]
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: /opt/keycloak/bin/kcadm.sh config credentials --server http://keycloak:8080 --realm master --user admin --password admin
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    security_opt:
+      - label=disable
+
+  # Started by the test once it has written opa_data/data.json from the dump.
+  opa:
+    image: openpolicyagent/opa:edge-static-debug
+    network_mode: host # Port 8181
+    volumes:
+      - ./opa:/mnt
+    environment:
+      - ISSUER=http://localhost:8081/realms/master
+    entrypoint: "sh /mnt/entrypoint.sh"
+    security_opt:
+      - label=disable
+
+  # dls-tiled's own image, so its access policy is what gets tested.
+  tiled:
+    build:
+      context: ../..
+      target: runtime
+    network_mode: host # Port 8407
+    volumes:
+      - ./tiled_config:/deploy/config:ro
+    command: ["tiled", "serve", "config", "/deploy/config", "--host", "0.0.0.0", "--port", "8407"]
+    security_opt:
+      - label=disable
