@@ -170,3 +170,50 @@ kubectl scale -n $NS deploy/<tiled-deployment> --replicas=1
 
 If the restore fails partway, drop the database and start again; don't try
 to patch a partial restore.
+
+## Troubleshooting
+
+### `KeyError: 'postgresql://<host>:5432/data'` when reading data
+
+After you restore a backup into a different deployment (for example, a prod
+dump restored into tiled-testing), reads of tabular data fail in
+`tiled/storage.py`, in `get_storage`.
+
+Each row in the catalog's `assets` table has a `data_uri` that names the
+storage it was written to. Tiled keys its storage by URI without credentials,
+built from the `writable_storage` and `readable_storage` entries in its config.
+If the restored rows still name the old host, the lookup fails. The migration
+script doesn't touch `data_uri`.
+
+To fix it, point the assets at the new host. Run this against the catalog
+database (`tiled`), not `data`. The `data` database must already exist in
+the new deployment with the same tables, or the `KeyError` becomes a
+missing-table error. Tiled reads `data_uri` on every request, so it doesn't
+need a restart.
+
+With the `postgres` password in `PGPASSWORD`, set the host that's in the
+error (`OLD`) and the host in this deployment's `writable_storage` (`NEW`):
+
+```bash
+OLD=tiled-postgres
+NEW=tiled-testing-postgres
+
+# Preview: the rows that will change
+kubectl exec -i -n $NS $POD -- env PGPASSWORD=$PGPASSWORD psql -U postgres -d tiled <<SQL
+SELECT data_uri, count(*) FROM assets
+WHERE data_uri LIKE 'postgresql://$OLD:5432/%'
+GROUP BY data_uri;
+SQL
+
+# Rewrite the host
+kubectl exec -i -n $NS $POD -- env PGPASSWORD=$PGPASSWORD psql -U postgres -d tiled -v ON_ERROR_STOP=1 <<SQL
+BEGIN;
+UPDATE assets
+SET data_uri = replace(data_uri, '//$OLD:5432/', '//$NEW:5432/')
+WHERE data_uri LIKE 'postgresql://$OLD:5432/%';
+COMMIT;
+SQL
+```
+
+Don't add the old URI to `readable_storage` instead. The deployment would
+then read from the other deployment's database, if it can reach it at all.
