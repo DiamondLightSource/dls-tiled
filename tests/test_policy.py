@@ -1,3 +1,4 @@
+import base64
 import json
 import uuid
 from types import SimpleNamespace
@@ -13,7 +14,10 @@ from tiled.config import parse_configs
 from tiled.queries import AccessBlobFilter
 from tiled.server.schemas import Principal, PrincipalType
 
+from dls_tiled import policy as policy_module
 from dls_tiled.policy import (
+    SERVICE_ACCOUNT_TAGS_TTL,
+    USER_TAGS_TTL,
     DiamondOpenPolicyAgentAuthorizationPolicy,
     _check_principal,
 )
@@ -255,6 +259,57 @@ async def test_filters_without_result_is_no_access(policy, user, opa):
     assert await policy.filters(None, user, None, set(), set()) is NO_ACCESS
 
 
+def jwt(claims: dict) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=")
+    return f"header.{payload.decode()}.signature"
+
+
+@pytest.fixture
+def clock(monkeypatch) -> list[float]:
+    now = [1000.0]
+    monkeypatch.setattr(policy_module.time, "monotonic", lambda: now[0])
+    return now
+
+
+@pytest.mark.parametrize(
+    "token, ttl",
+    [
+        (jwt({"fedid": "abc12345"}), USER_TAGS_TTL),
+        (jwt({"fedid": "abc12345", "beamline": "i22"}), USER_TAGS_TTL),
+        (jwt({"beamline": "i22"}), SERVICE_ACCOUNT_TAGS_TTL),
+        ("not-a-jwt", USER_TAGS_TTL),  # unreadable: the shorter TTL
+    ],
+)
+async def test_filters_cached_until_ttl(policy, opa, clock, token, ttl):
+    opa.responses[OPA + "tiled/user_sessions"] = {"result": ["beamline:i22"]}
+    user = make_principal(token=token)
+
+    first = await policy.filters(None, user, None, set(), set())
+    clock[0] += ttl - 1
+    assert await policy.filters(None, user, None, set(), set()) is first
+    assert len(opa.requests) == 1
+    clock[0] += 2
+    await policy.filters(None, user, None, set(), set())
+    assert len(opa.requests) == 2
+
+
+async def test_filters_cache_is_per_token(policy, opa, clock):
+    opa.responses[OPA + "tiled/user_sessions"] = {"result": ["beamline:i22"]}
+
+    for token in ("token-a", "token-b"):
+        await policy.filters(None, make_principal(token=token), None, set(), set())
+
+    assert len(opa.requests) == 2
+
+
+async def test_filters_no_result_not_cached(policy, user, opa, clock):
+    opa.responses[OPA + "tiled/user_sessions"] = {}
+    assert await policy.filters(None, user, None, set(), set()) is NO_ACCESS
+
+    opa.responses[OPA + "tiled/user_sessions"] = {"result": ["*"]}
+    assert await policy.filters(None, user, None, set(), set()) is ALL_ACCESS
+
+
 # --- init_node -----------------------------------------------------------------
 
 
@@ -274,12 +329,18 @@ async def test_init_node_empty_blob_not_public(user, opa):
     assert opa.requests == []
 
 
-async def test_init_node_returns_tag_from_opa(policy, user, opa):
-    opa.responses[OPA + "tiled/user_session"] = {"result": "12345"}
+async def test_init_node_returns_tags_from_opa(policy, user, opa):
+    # the session's own tag first, then its ancestors' grant tags
+    tags = [
+        "beamline:i22,proposal:1234,session:1234-5",
+        "beamline:i22,proposal:1234",
+        "beamline:i22",
+    ]
+    opa.responses[OPA + "tiled/user_session"] = {"result": tags}
 
     result = await policy.init_node(user, None, set(), {"tags": [BLOB_TAG]})
 
-    assert result == (True, {"tags": ["12345"]})
+    assert result == (True, {"tags": tags})
     assert opa.requests == [
         (
             OPA + "tiled/user_session",
