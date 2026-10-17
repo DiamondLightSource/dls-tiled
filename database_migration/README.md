@@ -137,16 +137,33 @@ tiled version in the runtime image):
 ```bash
 URI=postgresql://postgres:<password>@localhost:5432/tiled
 
-# Preview: prints what would move, changes nothing
+# Preview: prints what would move and retag, changes nothing
 uv run --script migrate_node_structure.py $URI --dry-run
 
 # Upgrade the tiled schema (to --revision, default head), then move the runs
-uv run --script migrate_node_structure.py $URI --revision head
+uv run --script migrate_node_structure.py $URI --revision head --authz-data data.json
 ```
+
+`--authz-data` is the authz bundle's `data.json` (in `bundle.tar.gz` from
+authz.diamond.ac.uk, or `GET /v1/data` from an OPA that has it loaded). The
+script uses it for nodes still tagged with a bare numeric session id that it
+can't move, such as runs without `start.instrument_session`: without the data
+they stay tagged with the id, which the current policy never grants, so only
+admins see them. With it they are retagged in place from that session's
+beamline, proposal and visit. They stay at the root, since the data has the
+proposal number but not the code (`cm`) the tree's keys use. The script prints
+how many ids it couldn't find.
+
+Besides moving runs, it gives nodes already in the tree that carry only their
+own tag (from blueapi under an earlier policy, or an earlier run of this
+script) the full tag list the current policy stamps, so beamline and proposal
+grants reach them. Deploy the matching authz policy with it: under an older
+policy, a session member's beamline tag would match every node on the beamline.
 
 The dry run only works if the database is already at tiled schema revision
 `e05e918092c3` or later; otherwise it says so, and the real run upgrades it
-first. Running the migration twice is safe: the second run moves nothing.
+first. Running the migration twice is safe: the second run moves and retags
+nothing.
 
 ## Restore from the backup (as postgres)
 

@@ -13,14 +13,25 @@ This is the layout blueapi's begin_task now writes into. The tiled schema is
 upgraded first (to --revision, default head) so the move runs against the
 nodes/nodes_closure layout this script expects.
 
-The new containers get the same composite access tags tiled.rego stamps on
-nodes it creates, and every tagged node under a moved run is retagged with
-its session tag. Runs written under the old policy carry a bare numeric
-session id, which the new policy's user_sessions never returns, so they
-would become invisible to users otherwise.
+The new containers get the same access tags tiled.rego stamps on nodes it
+creates (its Node Tags: the node's own tag, then each ancestor's grant tag),
+and every tagged node under a moved run is retagged with its session's tags.
+Runs written under the old policy carry a bare numeric session id, which the
+new policy's user_sessions never returns, so they would become invisible to
+users otherwise.
+
+Nodes already in the tree tagged with only their own composite tag (made by
+blueapi under an earlier version of the policy, or by an earlier run of this
+script) get the full tag list too; without the ancestor tags a beamline or
+proposal grant would not reach them.
 
 Runs at the root without start.instrument / start.instrument_session, or whose
-instrument_session doesn't parse, are left where they are and listed. Safe to
+instrument_session doesn't parse, are left where they are and listed. Their
+bare numeric session id would make them invisible to everyone but admins, so
+with --authz-data (the authz bundle's data.json) any node still tagged with one
+is retagged in place from that session's beamline, proposal and visit. They
+can't be moved: the data has the proposal number but not its code ("cm"), which
+the tree's keys use. Ids the data doesn't know are listed. Safe to
 rerun: anything already moved is no longer a child of the root.
 
 Postgres only.
@@ -52,14 +63,46 @@ INSTRUMENT_SESSION_RE = re.compile(
 )
 
 
+# A node's own tag as tiled.rego's beamline_tag/proposal_tag/session_tag build it
+COMPOSITE_TAG_RE = re.compile(
+    r"^beamline:(?P<beamline>[^,]+)"
+    r"(?:,proposal:(?P<proposal>\d+)(?:,session:(?P=proposal)-(?P<visit>\d+))?)?$"
+)
+
+
 def tags(beamline: str, proposal_number: int | None = None, visit=None) -> dict:
-    """The access blob tiled.rego's beamline_tag/proposal_tag/session_tag give."""
-    tag = f"beamline:{beamline}"
-    if proposal_number is not None:
-        tag += f",proposal:{proposal_number}"
-    if visit is not None:
-        tag += f",session:{proposal_number}-{visit}"
-    return {"tags": [tag]}
+    """The access blob tiled.rego stamps on a node at this level (its Node Tags):
+    the node's own tag first, then each ancestor's grant tag so a beamline or
+    proposal grant covers the subtree, and on the two container levels a
+    visible: tag so callers granted something below can still list them."""
+    beamline_tag = f"beamline:{beamline}"
+    if proposal_number is None:
+        return {"tags": [beamline_tag, f"visible:{beamline_tag}"]}
+    proposal_tag = f"{beamline_tag},proposal:{proposal_number}"
+    if visit is None:
+        return {"tags": [proposal_tag, beamline_tag, f"visible:{proposal_tag}"]}
+    session_tag = f"{proposal_tag},session:{proposal_number}-{visit}"
+    return {"tags": [session_tag, proposal_tag, beamline_tag]}
+
+
+def tags_from_own_tag(tag: str, sessions: dict | None = None) -> dict | None:
+    """The full access blob for a node tagged with just its own composite tag,
+    or with a bare numeric session id found in `sessions` (authz data's
+    sessions, keyed by id); None if `tag` is neither."""
+    if tag.isdigit():
+        if (session := (sessions or {}).get(tag)) is None:
+            return None
+        return tags(
+            session["beamline"], session["proposal_number"], session["visit_number"]
+        )
+    if (match := COMPOSITE_TAG_RE.match(tag)) is None:
+        return None
+    number, visit = match["proposal"], match["visit"]
+    return tags(
+        match["beamline"],
+        int(number) if number else None,
+        int(visit) if visit else None,
+    )
 
 
 def plan_moves(runs):
@@ -110,7 +153,7 @@ async def get_or_create(conn, parent: int, key: str, access_blob: dict) -> int:
     return node_id
 
 
-async def migrate(uri: str, dry_run: bool) -> None:
+async def migrate(uri: str, dry_run: bool, sessions: dict | None = None) -> None:
     engine = create_async_engine(uri)
     try:
         async with engine.begin() as conn:
@@ -138,8 +181,58 @@ async def migrate(uri: str, dry_run: bool) -> None:
             for where, n in sorted(counts.items()):
                 print(f"  root/{where}: {n} runs")
             print(f"{len(moves)} runs to move into {len(counts)} sessions.")
-            if dry_run or not moves:
+
+            # Nodes still carrying only their own composite tag, by that tag.
+            single = (
+                await conn.execute(
+                    text(
+                        "SELECT access_blob -> 'tags' ->> 0, count(*) FROM nodes "
+                        "WHERE jsonb_typeof(access_blob -> 'tags') = 'array' "
+                        "AND jsonb_array_length(access_blob -> 'tags') = 1 "
+                        "GROUP BY 1"
+                    )
+                )
+            ).all()
+            retags, to_retag, unknown = [], 0, 0
+            for tag, n in single:
+                if (blob := tags_from_own_tag(tag, sessions)) is not None:
+                    retags.append({"old": json.dumps([tag]), "blob": json.dumps(blob)})
+                    to_retag += n
+                elif tag.isdigit():
+                    unknown += n
+            print(f"{to_retag} nodes to give their full tags.")
+            if unknown:
+                # Includes the runs moved below, which get their tags from the move.
+                where = "not in --authz-data" if sessions else "(pass --authz-data)"
+                print(f"{unknown} nodes carry a bare session id {where}.")
+            if dry_run or not (moves or retags):
                 print("Nothing changed.")
+                return
+
+            if retags:
+                # One join, so nodes is scanned once rather than once per tag
+                # (the GIN index on access_blob can't serve -> 'tags' = ...).
+                await conn.execute(
+                    text(
+                        "CREATE TEMP TABLE retags (old jsonb PRIMARY KEY, "
+                        "blob jsonb NOT NULL) ON COMMIT DROP"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO retags VALUES "
+                        "(CAST(:old AS jsonb), CAST(:blob AS jsonb))"
+                    ),
+                    retags,
+                )
+                await conn.execute(
+                    text(
+                        "UPDATE nodes n SET access_blob = r.blob FROM retags r "
+                        "WHERE n.access_blob -> 'tags' = r.old"
+                    )
+                )
+                print(f"Gave {to_retag} nodes their full tags.")
+            if not moves:
                 return
 
             containers: dict[tuple, int] = {}
@@ -228,6 +321,12 @@ def main() -> None:
         help="tiled catalog schema revision to upgrade to first (default: head)",
     )
     parser.add_argument(
+        "--authz-data",
+        type=argparse.FileType(),
+        help="the authz bundle's data.json, to retag nodes still carrying a bare "
+        "numeric session id (e.g. runs left at the root) from that session",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Skip the upgrade and only print what would move",
@@ -249,7 +348,11 @@ def main() -> None:
             f"Revision {revision} predates the closure table ({CLOSURE_REVISION}); "
             "upgrade to it or later before migrating."
         )
-    asyncio.run(migrate(uri, args.dry_run))
+    sessions = None
+    if args.authz_data:
+        data = json.load(args.authz_data)
+        sessions = data.get("diamond", {}).get("data", data)["sessions"]
+    asyncio.run(migrate(uri, args.dry_run, sessions))
 
 
 if __name__ == "__main__":

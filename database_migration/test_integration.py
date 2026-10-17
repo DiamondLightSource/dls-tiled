@@ -369,7 +369,7 @@ def test_user_sees_only_their_session(migrated):
         assert {n["id"] for n in top.json()["data"]} & beamlines == {beamline}
         for node_id, path in moves:
             response = client.get(f"/metadata/{path_of(path)}/{before[node_id]['key']}")
-            if path[-1][1]["tags"] == [mine]:
+            if path[-1][1]["tags"][0] == mine:
                 assert response.status_code == 200, response.text
             else:
                 assert response.status_code == 404, path_of(path)
