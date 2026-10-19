@@ -636,6 +636,63 @@ def test_a_cache_time_of_zero_turns_sharing_off():
     assert compute.calls == 2
 
 
+def grow_grid_scan(client, uid, n_from, n_to):
+    """Append points n_from..n_to of write_grid_scan's raster to a run, as a
+    scan in progress does"""
+    primary = client[uid]["primary"]
+    x = numpy.array([0.0, 1.0, 2.0] * 3)[n_from:n_to]
+    y = numpy.repeat([0.0, 1.0, 2.0], 3)[n_from:n_to]
+    primary["X"].patch(x, offset=n_from, extend=True)
+    primary["Y"].patch(y, offset=n_from, extend=True)
+    for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
+        primary[channel].patch(
+            numpy.arange(9.0)[n_from:n_to], offset=n_from, extend=True
+        )
+
+
+@pytest.mark.parametrize("route", ["binned", "render"])
+def test_a_shared_result_is_not_reused_once_the_run_has_grown(
+    client, monkeypatch, route
+):
+    monkeypatch.setattr(visr, "BINNED_CACHE_SECONDS", 60.0)
+    write_grid_scan(client, "growing", 7)
+    http = client.context.http_client
+
+    before = http.get(f"/api/v1/{route}/growing").json()
+    grow_grid_scan(client, "growing", 7, 9)
+    after = http.get(f"/api/v1/{route}/growing").json()
+
+    assert (before["n_points"], after["n_points"]) == (7, 9)
+
+
+def test_a_shared_result_is_not_reused_once_the_run_has_stopped(client, monkeypatch):
+    monkeypatch.setattr(visr, "BINNED_CACHE_SECONDS", 60.0)
+    write_grid_scan(client, "ending", 9)
+    http = client.context.http_client
+    compute = []
+    real = visr._binned_output
+
+    async def counting(*args):
+        compute.append(1)
+        return await real(*args)
+
+    monkeypatch.setattr(visr, "_binned_output", counting)
+
+    http.get("/api/v1/binned/ending")
+    http.get("/api/v1/binned/ending")  # reused
+    run = client["ending"]
+    run.update_metadata(metadata={**run.metadata, "stop": {"exit_status": "success"}})
+    http.get("/api/v1/binned/ending")
+
+    assert len(compute) == 2
+
+
+def test_run_progress_is_unknown_for_a_run_that_is_not_there(client):
+    root = client.context.http_client.app.state.root_tree
+
+    assert asyncio.run(visr._run_progress(root, "nowhere")) == (None, None)
+
+
 def test_binned_has_an_etag_and_answers_304_when_nothing_changed(client, monkeypatch):
     monkeypatch.setattr(visr, "BINNED_CACHE_SECONDS", 0.5)
     write_grid_scan(client, "grid", 9)
