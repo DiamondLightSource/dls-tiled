@@ -302,6 +302,89 @@ def test_render_ovals_returns_an_outline_layer(client):
     assert png.headers["content-type"] == "image/png"
 
 
+# the RGB diodes
+
+
+def write_diodes(client, uid, values):
+    primary = client[uid]["primary"]
+    for colour in ("red", "green", "blue"):
+        primary.write_array(
+            numpy.asarray(values, dtype=float), key=f"spectroscopy_diodes-{colour}"
+        )
+
+
+def test_render_has_null_diodes_for_a_run_without_them(client):
+    write_scan(client, "camera-only")
+
+    channels = get(client, "camera-only", size=3).json()["channels"]
+
+    assert channels["RedTotal"][0] == [0.0, 1.0, 2.0]
+    assert channels["DiodesRed"] is None
+    assert channels["DiodesGreen"] is None
+    assert channels["DiodesBlue"] is None
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"kind": "cells"},
+        {"kind": "rectangles"},
+        {"kind": "gaussian"},
+        {"kind": "ovals", "beam_x": 1.3, "beam_y": 1.3},
+    ],
+)
+def test_render_draws_the_diodes_like_the_camera(client, params):
+    write_scan(client, "diodes")
+    write_diodes(client, "diodes", numpy.arange(9.0))
+
+    channels = get(client, "diodes", size=30, **params).json()["channels"]
+
+    assert channels["DiodesRed"] == channels["RedTotal"]
+    assert channels["DiodesGreen"] == channels["GreenTotal"]
+    assert channels["DiodesBlue"] == channels["BlueTotal"]
+
+
+@pytest.mark.parametrize(
+    "params",
+    [{"kind": "cells"}, {"kind": "ovals", "beam_x": 0.9, "beam_y": 0.9}],
+)
+def test_render_draws_nothing_where_the_diodes_are_behind_the_camera(client, params):
+    write_scan(client, "lagging")
+    write_diodes(client, "lagging", numpy.arange(7.0))
+
+    channels = get(client, "lagging", size=3, **params).json()["channels"]
+
+    assert channels["RedTotal"][2] == [6.0, 7.0, 8.0]
+    assert channels["DiodesRed"][2] == [6.0, None, None]
+    assert channels["DiodesRed"][:2] == channels["RedTotal"][:2]
+
+
+def test_render_png_of_a_diode_channel(client):
+    write_scan(client, "diode-png")
+    write_diodes(client, "diode-png", numpy.arange(9.0))
+    write_scan(client, "no-diode-png")
+
+    found = get(client, "diode-png", format="png", channel="DiodesBlue", size=8)
+    missing = get(client, "no-diode-png", format="png", channel="DiodesBlue")
+
+    assert found.headers["content-type"] == "image/png"
+    assert missing.status_code == 404
+
+
+def test_render_cells_leave_out_points_without_a_value():
+    image, coverage = rendering.render_cells(
+        [1.0, numpy.nan, 3.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0],
+        numpy.array([-0.5, 0.5, 1.5]),
+        numpy.array([-0.5, 0.5]),
+        Viewport.fit(-0.5, 1.5, -0.5, 0.5, 2),
+    )
+
+    assert image.tolist() == [[1.0, 3.0]]  # not NaN where a NaN shares the cell
+    assert coverage.tolist() == [[1.0, 1.0]]
+
+
 @pytest.mark.parametrize(
     "params",
     [

@@ -77,8 +77,11 @@ def _finish(total, weight, coverage):
 
 
 def render_cells(values, x, y, x_edges, y_edges, viewport: Viewport):
-    """The scan's grid cells (mean of the points in each), sampled at each pixel."""
+    """The scan's grid cells (mean of the points in each), sampled at each pixel.
+    Points without a finite value are left out."""
     values = numpy.asarray(values, dtype=float)
+    finite = numpy.isfinite(values)
+    values, x, y = values[finite], numpy.asarray(x)[finite], numpy.asarray(y)[finite]
     counts, _, _ = numpy.histogram2d(x, y, bins=[x_edges, y_edges])
     sums, _, _ = numpy.histogram2d(x, y, bins=[x_edges, y_edges], weights=values)
     xs, ys = viewport.centres()
@@ -251,7 +254,14 @@ def to_rows(image) -> list[list[float | None]]:
     return out.tolist()
 
 
-CHANNEL_COLOUR = {"RedTotal": 0, "GreenTotal": 1, "BlueTotal": 2}
+CHANNEL_COLOUR = {
+    "RedTotal": 0,
+    "GreenTotal": 1,
+    "BlueTotal": 2,
+    "DiodesRed": 0,
+    "DiodesGreen": 1,
+    "DiodesBlue": 2,
+}
 
 
 def to_png(image, coverage, colour=0, vmin=None, vmax=None, outline=None) -> bytes:
