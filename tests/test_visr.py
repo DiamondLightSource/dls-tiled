@@ -1180,3 +1180,98 @@ def test_binned_retries_a_lagging_file_then_answers_503(
     assert response.status_code == status, response.text
     if status == 503:
         assert response.headers["retry-after"] == "1"
+
+
+# the RGB diodes
+
+
+SQUARE_X, SQUARE_Y = [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]
+DIODES = {"red": [10.0, 11.0, 12.0, 13.0], "green": [20.0] * 4, "blue": [30.0] * 4}
+
+
+def test_binned_has_null_diodes_for_a_run_without_them(client):
+    write_points(client, "camera-only", SQUARE_X, SQUARE_Y)
+
+    body = client.context.http_client.get(
+        "/api/v1/binned/camera-only", params={"width": 2, "height": 2}
+    ).json()
+
+    assert body["RedTotal"] == [[0.0, 1.0], [2.0, 3.0]]
+    assert body["DiodesRed"] is None
+    assert body["DiodesGreen"] is None
+    assert body["DiodesBlue"] is None
+
+
+@pytest.mark.parametrize("names", ["spectroscopy_diodes-{}", "{}"])
+def test_binned_bins_a_fly_scans_diodes_beside_the_camera(client, names):
+    write_points(client, "fly", SQUARE_X, SQUARE_Y)
+    primary = client["fly"]["primary"]
+    for colour, values in DIODES.items():
+        primary.write_array(numpy.array(values), key=names.format(colour))
+
+    body = client.context.http_client.get(
+        "/api/v1/binned/fly", params={"width": 2, "height": 2}
+    ).json()
+
+    assert body["DiodesRed"] == [[10.0, 11.0], [12.0, 13.0]]
+    assert body["DiodesGreen"] == [[20.0, 20.0], [20.0, 20.0]]
+    assert body["DiodesBlue"] == [[30.0, 30.0], [30.0, 30.0]]
+    assert body["RedTotal"] == [[0.0, 1.0], [2.0, 3.0]]
+
+
+def test_binned_bins_a_step_scans_diodes_from_its_event_table(client):
+    # a step scan reads positions and diodes into one table, primary/internal
+    import pandas
+
+    primary = client.create_container("step").create_container("primary")
+    primary.write_dataframe(
+        pandas.DataFrame(
+            {
+                "sample_stage-x": SQUARE_X,
+                "sample_stage-y": SQUARE_Y,
+                **{f"spectroscopy_diodes-{c}": v for c, v in DIODES.items()},
+            }
+        ),
+        key="internal",
+    )
+    for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
+        primary.write_array(numpy.arange(4.0), key=channel)
+
+    response = client.context.http_client.get(
+        "/api/v1/binned/step", params={"width": 2, "height": 2}
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["DiodesRed"] == [[10.0, 11.0], [12.0, 13.0]]
+    assert body["RedTotal"] == [[0.0, 1.0], [2.0, 3.0]]
+
+
+def test_binned_diodes_behind_the_camera_hold_nothing_back(client):
+    write_points(client, "lagging", SQUARE_X, SQUARE_Y)
+    primary = client["lagging"]["primary"]
+    for colour, values in DIODES.items():
+        primary.write_array(
+            numpy.array(values[:3]), key=f"spectroscopy_diodes-{colour}"
+        )
+
+    body = client.context.http_client.get(
+        "/api/v1/binned/lagging", params={"width": 2, "height": 2}
+    ).json()
+
+    assert body["n_points"] == 4
+    assert body["RedTotal"] == [[0.0, 1.0], [2.0, 3.0]]
+    # on the camera's bins, the cell the diodes haven't reached empty
+    assert body["DiodesRed"] == [[10.0, 11.0], [12.0, None]]
+
+
+def test_binned_diodes_follow_the_scans_grid(client):
+    write_grid_scan(client, "grid", 9)
+    primary = client["grid"]["primary"]
+    for colour in DIODES:
+        primary.write_array(numpy.arange(9.0), key=f"spectroscopy_diodes-{colour}")
+
+    body = client.context.http_client.get("/api/v1/binned/grid").json()
+
+    assert numpy.shape(body["DiodesRed"]) == numpy.shape(body["RedTotal"])
+    assert body["DiodesRed"] == body["RedTotal"]
