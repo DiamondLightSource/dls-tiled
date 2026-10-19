@@ -104,6 +104,27 @@ async def _shared(key: tuple, compute):
     return await asyncio.shield(task)
 
 
+async def _run_progress(root, uid) -> tuple:
+    """How far a run has got, as its catalog records it: whether it has a stop
+    document, and the shape of its camera's ``RedTotal`` (one entry per point).
+
+    Part of the key of a shared result, so a result is never reused once the run
+    has moved on. Without it, the poll a UI makes when a scan ends could be
+    given the result of the poll just before, computed without the last points.
+    Anything that can't be looked up counts as unknown (``None``)."""
+    try:
+        run = await root.lookup_adapter([uid])
+        stopped = bool((run.metadata() or {}).get("stop"))
+    except Exception:
+        return (None, None)
+    try:
+        camera = await root.lookup_adapter([uid, "primary", "RedTotal"])
+        shape = tuple(camera.structure().shape)
+    except Exception:
+        shape = None
+    return (stopped, shape)
+
+
 async def _compute_and_keep(key: tuple, compute):
     try:
         result = await compute()
@@ -653,12 +674,17 @@ async def binned(  # type: ignore
 
     # A UI polls this several times a second per client while points arrive only
     # every couple of seconds, so identical requests share one computation (and
-    # one read of the files) and its result is reused for a moment.
+    # one read of the files) and its result is reused for a moment, but only
+    # while the run is where it was (see _run_progress).
     # The key leaves out who is asking. That is safe only because the data is
     # read through root_tree.lookup_adapter, which bypasses Tiled's access policy
     # anyway; if per-run access control is added, the key needs the principal
     # (or its access tags), or one user's result could be served to another.
-    key = (uid, tuple(sorted(request.query_params.multi_items())))
+    key = (
+        uid,
+        tuple(sorted(request.query_params.multi_items())),
+        await _run_progress(root, uid),
+    )
 
     async def compute():
         output = await _binned_output(
@@ -1167,7 +1193,12 @@ async def render(  # type: ignore
     root = request.app.state.root_tree
     uid = [s for s in path.strip("/").split("/") if s][0]
     # Shared like /binned's results, and with the same caveat about access control.
-    key = ("render", uid, tuple(sorted(request.query_params.multi_items())))
+    key = (
+        "render",
+        uid,
+        tuple(sorted(request.query_params.multi_items())),
+        await _run_progress(root, uid),
+    )
 
     async def compute():
         points = await load_points(
