@@ -614,9 +614,11 @@ async def binned(  # type: ignore
 ):
     """Fetch a folded representation of an array dataset.
 
-    Returns ``RedTotal``/``GreenTotal``/``BlueTotal`` as matrices with one row per
-    y bin and one column per x bin (the layout image plots expect), ``null`` for
-    bins no point fell into, ``x_limits``/``y_limits`` as the bin edges (one more
+    Returns ``RedTotal``/``GreenTotal``/``BlueTotal`` (the camera) and
+    ``DiodesRed``/``DiodesGreen``/``DiodesBlue`` (the RGB diodes, ``null`` if the
+    run has none) as matrices with one row per y bin and one column per x bin
+    (the layout image plots expect), ``null`` for bins no point fell into, the
+    diodes on the camera's bins, ``x_limits``/``y_limits`` as the bin edges (one more
     than the columns/rows), ``n_points``, the number of scan points used, and
     ``n_total``, the number the scan will have (``null`` if the run has no spec),
     and ``position_offset``: ``{"x": dx, "y": dy}`` when the recorded positions
@@ -699,6 +701,38 @@ def _conditional(request: Request, payload: bytes, media: str, tag: str) -> Resp
     return Response(payload, media_type=media, headers=headers)
 
 
+CAMERA_CHANNELS = ("RedTotal", "GreenTotal", "BlueTotal")
+
+# The RGB diodes, by their name in the /binned answer, with where runs record
+# them: the first path that exists wins. Fly scans write the PandA's per-frame
+# means into primary, step scans read the diodes into the event table.
+DIODE_CHANNELS = {
+    name: (
+        (f"spectroscopy_diodes-{colour}",),
+        ("internal", f"spectroscopy_diodes-{colour}"),
+        (colour,),
+    )
+    for name, colour in (
+        ("DiodesRed", "red"),
+        ("DiodesGreen", "green"),
+        ("DiodesBlue", "blue"),
+    )
+}
+
+
+async def read_optional_channel(root, uid, places) -> numpy.ndarray | None:
+    """A channel's values from the first of ``places`` under the run's primary
+    stream that exists, or None if the run records it in none of them."""
+    for place in places:
+        try:
+            found = await get_data(root, [uid, "primary", *place])
+        except NoEntry:
+            continue
+        if isinstance(found, (H5Dataset, numpy.ndarray)):
+            return numpy.asarray(found)
+    return None
+
+
 class ScanPoints(NamedTuple):
     """The points of a run ready to draw: each channel's values, their positions,
     how many there are, whether they were placed on the scan's grid, and the
@@ -714,9 +748,22 @@ class ScanPoints(NamedTuple):
 
 
 async def load_points(
-    root, uid, x_dim_index, y_dim_index, setpoints, slice_dim, grid=None
+    root,
+    uid,
+    x_dim_index,
+    y_dim_index,
+    setpoints,
+    slice_dim,
+    grid=None,
+    optional_channels=None,
 ):
     """Read a run's channels and positions, reconciled to one length and sliced.
+
+    ``optional_channels`` maps more channel names to where runs may record them
+    (see ``read_optional_channel``). One the run doesn't record is left out of
+    ``data``. They take no part in reconciling lengths, so a lagging one never
+    holds the camera channels back: it keeps only the points it has, and may be
+    shorter than the positions.
 
     Positions are the recorded readbacks, or the spec's setpoints with
     ``setpoints``. With a ``grid`` (for x and y as dimensions 0 and 1), the
@@ -844,6 +891,10 @@ async def load_points(
         "GreenTotal": green_total,
         "BlueTotal": blue_total,
     }
+    for name, places in (optional_channels or {}).items():
+        found = await read_optional_channel(root, uid, places)
+        if found is not None:
+            data[name] = found[:common_len]
 
     readbacks = numpy.asarray(readbacks, dtype=float)
     on_grid, offset = False, None
@@ -887,7 +938,7 @@ async def load_points(
             mask &= numpy.abs(readbacks[dim, :] - center) <= thickness
 
         readbacks = readbacks[:, mask]
-        data = {channel: d[mask] for channel, d in data.items()}
+        data = {channel: d[mask[: len(d)]] for channel, d in data.items()}
 
     # A point with no position on x or y (NaN: a run that only moved x has no
     # y readings, say) can't be placed in any bin, and numpy's default binning
@@ -971,6 +1022,7 @@ async def _binned_output(
         setpoints,
         slice_dim,
         grid if use_grid else None,
+        optional_channels=DIODE_CHANNELS,
     )
     data, x_positions, y_positions = points.data, points.x, points.y
     n_points, position_offset = points.n_points, points.offset
@@ -981,15 +1033,32 @@ async def _binned_output(
     def bin_channels() -> dict:
         """The CPU-bound part, run off the event loop."""
         binned_output: dict = {}
-        for channel in ("RedTotal", "GreenTotal", "BlueTotal"):
-            binned_channel = compute_binned_image(
+        camera = {
+            channel: compute_binned_image(
                 data[channel], x_positions, y_positions, **histogram2d_kwargs
             )
+            for channel in CAMERA_CHANNELS
+        }
+        for channel, binned_channel in camera.items():
             binned_output[channel] = image_rows_are_y(
                 binned_channel["img"], binned_channel["counts"]
             )
-        binned_output["x_limits"] = binned_channel["x"].tolist()
-        binned_output["y_limits"] = binned_channel["y"].tolist()
+        x_edges, y_edges = camera["RedTotal"]["x"], camera["RedTotal"]["y"]
+        binned_output["x_limits"] = x_edges.tolist()
+        binned_output["y_limits"] = y_edges.tolist()
+        # on the camera's bins, which the diodes may have fewer points than
+        for channel in DIODE_CHANNELS:
+            values = data.get(channel)
+            if values is None:
+                binned_output[channel] = None
+                continue
+            n = len(values)
+            binned_diode = compute_binned_image(
+                values, x_positions[:n], y_positions[:n], bins=[x_edges, y_edges]
+            )
+            binned_output[channel] = image_rows_are_y(
+                binned_diode["img"], binned_diode["counts"]
+            )
         return binned_output
 
     binned_output = await anyio.to_thread.run_sync(bin_channels)
