@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy
 import pytest
 from fastapi import HTTPException
-from scanspec.specs import Line, Spiral
+from scanspec.specs import Ellipse, Line, Spiral
 from tiled.adapters.utils import DataNotReadyError
 from tiled.catalog import in_memory
 from tiled.client import Context, from_context
@@ -354,6 +354,22 @@ def test_grid_of_a_single_point():
     assert x_edges.tolist() == [1.5, 2.5]
     assert y_edges.tolist() == [0.5, 1.5]
     assert n_total == 1
+
+
+def test_grid_is_none_for_a_spec_with_no_points():
+    # an ellipse narrower than its step holds no setpoints at all
+    spec = Ellipse(
+        x_axis="x",
+        x_centre=0.3,
+        x_diameter=0.01,
+        x_step=1,
+        y_axis="y",
+        y_centre=0.3,
+        y_diameter=0.01,
+        y_step=1,
+    )
+
+    assert _grid_or_none(spec) is None
 
 
 def write_grid_scan(client, uid, n_points):
