@@ -962,7 +962,8 @@ async def load_points(
                 ),
             )
         readbacks = readbacks[:, positioned]
-        data = {channel: d[positioned] for channel, d in data.items()}
+        # an optional channel can be shorter than the positions (behind them)
+        data = {channel: d[positioned[: len(d)]] for channel, d in data.items()}
 
     assert isinstance(red_total, (H5Dataset, numpy.ndarray))
     logger.debug(
@@ -1138,7 +1139,10 @@ async def render(  # type: ignore
     extent) at ``size`` pixels along its longer side.
 
     ``format=json`` returns every channel as rows (row 0 at ``y0``, ``null``
-    where nothing is drawn) plus a ``coverage`` layer (0 to 1). ``format=png``
+    where nothing is drawn) plus the camera's ``coverage`` layer (0 to 1). The
+    diode channels (``DiodesRed``/``DiodesGreen``/``DiodesBlue``) are ``null``
+    for a run without diodes, and ``null`` where they are behind the camera.
+    ``format=png``
     returns one ``channel`` as a tinted RGBA image, transparent where nothing is
     drawn, scaled to ``vmin``/``vmax`` if given (else to its own range). For
     ``ovals``, JSON adds an ``outline`` layer (opacity of the white lines) and
@@ -1171,10 +1175,31 @@ async def render(  # type: ignore
 
     async def compute():
         points = await load_points(
-            root, uid, 0, 1, setpoints, slice_dim, await get_scan_grid(root, uid)
+            root,
+            uid,
+            0,
+            1,
+            setpoints,
+            slice_dim,
+            await get_scan_grid(root, uid),
+            optional_channels=DIODE_CHANNELS,
         )
         # the grid the points were placed on, which may have x and y swapped
         x, y, offset, grid = points.x, points.y, points.offset, points.grid
+        if format == "png" and channel not in points.data:
+            raise HTTPException(
+                status_code=404, detail=f"run {uid} has no {channel} channel"
+            )
+
+        def values_of(name):
+            """A channel's values, one per point: a diode channel behind the
+            camera is padded with NaN, which draws nothing."""
+            values = numpy.asarray(points.data[name], dtype=float)
+            if len(values) < len(x):
+                values = numpy.concatenate(
+                    [values, numpy.full(len(x) - len(values), numpy.nan)]
+                )
+            return values
 
         step = _nominal_step(grid) if grid is not None else None
         if grid is not None:
@@ -1264,7 +1289,7 @@ async def render(  # type: ignore
             """Draw and encode: the CPU-bound part, run off the event loop."""
             outline = outline_of()
             if format == "png":
-                image, coverage = draw(points.data[channel])
+                image, coverage = draw(values_of(channel))
                 png = rendering.to_png(
                     image,
                     coverage,
@@ -1275,11 +1300,15 @@ async def render(  # type: ignore
                 )
                 return png, "image/png"
             else:
-                images = {
-                    name: draw(points.data[name])
-                    for name in ("RedTotal", "GreenTotal", "BlueTotal")
+                # each channel's (image, coverage), None for a diode it lacks
+                images: dict[str, Any] = {
+                    name: draw(values_of(name)) for name in CAMERA_CHANNELS
                 }
-                coverage = next(iter(images.values()))[1]
+                coverage = images["RedTotal"][1]
+                for name in DIODE_CHANNELS:
+                    images[name] = (
+                        draw(values_of(name)) if name in points.data else None
+                    )
                 output = {
                     "kind": kind,
                     "viewport": {
@@ -1291,8 +1320,8 @@ async def render(  # type: ignore
                         "height": viewport.height,
                     },
                     "channels": {
-                        name: rendering.to_rows(img)
-                        for name, (img, _) in images.items()
+                        name: None if drawn is None else rendering.to_rows(drawn[0])
+                        for name, drawn in images.items()
                     },
                     "coverage": numpy.round(coverage, 3).tolist(),
                     **(

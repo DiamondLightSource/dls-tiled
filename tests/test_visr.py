@@ -1275,3 +1275,23 @@ def test_binned_diodes_follow_the_scans_grid(client):
 
     assert numpy.shape(body["DiodesRed"]) == numpy.shape(body["RedTotal"])
     assert body["DiodesRed"] == body["RedTotal"]
+
+
+def test_binned_leaves_out_points_without_a_position_when_diodes_are_behind(client):
+    # positions for 4 points, the third without one; diodes for only 3
+    write_points(client, "gap", [0.0, 1.0, numpy.nan, 1.0], [0.0, 0.0, 1.0, 1.0])
+    primary = client["gap"]["primary"]
+    for colour, values in DIODES.items():
+        primary.write_array(
+            numpy.array(values[:3]), key=f"spectroscopy_diodes-{colour}"
+        )
+
+    response = client.context.http_client.get(
+        "/api/v1/binned/gap", params={"width": 2, "height": 2}
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["n_points"] == 3
+    assert body["RedTotal"] == [[0.0, 1.0], [None, 3.0]]
+    assert body["DiodesRed"] == [[10.0, 11.0], [None, None]]
