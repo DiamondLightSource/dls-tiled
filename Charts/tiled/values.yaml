@@ -39,6 +39,39 @@ config:
         writable_storage: "/storage/data"
         init_if_not_exists: true
 
+# A postgres holding one catalog database shared by every beamline. The tiled
+# pods initialize it on first start, and get PGHOST, PGUSER, PGPASSWORD and
+# PGDATABASE, so point the trees at it with
+#   uri: "postgresql://$PGUSER:$PGPASSWORD@$PGHOST/$PGDATABASE"
+# in place of the default sqlite one.
+# The password must be URL-safe, as it is put into the uri as is.
+postgresql:
+  enabled: false
+  image:
+    repository: postgres
+    tag: "18"
+    pullPolicy: IfNotPresent
+  user: tiled
+  database: tiled
+  # Only read when the data volume is empty; changing it later needs ALTER USER
+  passwordSecret:
+    name: tiled-secrets
+    key: POSTGRES_PASSWORD
+  storage: 10Gi
+  storageClassName: ""
+  resources: {}
+  # The postgres user of the image, which owns the data directory
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 999
+    runAsGroup: 999
+    fsGroup: 999
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
 # Restart the tiled and envoy pods when their ConfigMap changes, by putting a
 # checksum of it in a pod annotation. See
 # https://helm.sh/docs/howto/charts_tips_and_tricks/#automatically-roll-deployments
