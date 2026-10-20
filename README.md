@@ -54,6 +54,43 @@ Plugins are off by default; see the `config.routers` comment in
 `Charts/tiled/values.yaml`. The `TILED_SINGLE_USER_API_KEY` environment variable
 is read from the optional secret `tiled-secrets`.
 
+### Postgres databases
+
+Tiled uses postgres for the catalog (`tiled`), the authentication database
+(`auth`) and tabular data storage (`data`). Until this is done by an init
+container in the chart, create and initialize them by hand.
+
+Create the databases from the postgres pod:
+
+```bash
+kubectl exec -it tiled-testing-postgres-77669bf4c5-t8jmc -n tiled-staging -- psql -U postgres
+```
+
+```sql
+CREATE DATABASE tiled;
+CREATE DATABASE auth;
+CREATE DATABASE data;
+```
+
+Then start a throwaway tiled pod, exec into it and create the tables:
+
+```bash
+kubectl run tiled-init -n tiled-staging --image=ghcr.io/bluesky/tiled:0.2.18 \
+  --restart=Never --command \
+  -- sleep infinity
+kubectl exec -it tiled-init -n tiled-staging -- bash
+```
+
+```bash
+export POSTGRESQL_PASSWORD="password"
+
+tiled catalog init --if-not-exists postgresql+asyncpg://postgres:${POSTGRESQL_PASSWORD}@tiled-testing-postgres:5432/tiled
+
+tiled admin initialize-database postgresql+asyncpg://postgres:${POSTGRESQL_PASSWORD}@tiled-testing-postgres:5432/auth
+
+kubectl delete pod tiled-init -n tiled-staging --now
+```
+
 ## Logging
 
 tiled's default logging config has no handler for the plugin loggers, so their
