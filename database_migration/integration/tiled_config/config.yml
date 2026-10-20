@@ -1,0 +1,23 @@
+authentication:
+  providers:
+    - provider: keycloak_oidc
+      authenticator: tiled.authenticators:ProxiedOIDCAuthenticator
+      args:
+        audience: account
+        client_id: tiled
+        device_flow_client_id: tiled-cli
+        # Keycloak tokens have no "scp" claim, so this grants these to all.
+        scopes_map:
+          read: ["read:metadata", "read:data"]
+        well_known_uri: "http://localhost:8081/realms/master/.well-known/openid-configuration"
+trees:
+  - path: /
+    tree: catalog
+    args:
+      uri: "postgresql://postgres:postgres@localhost:5433/tiled"
+      writable_storage: "/tmp/data"
+access_control:
+  access_policy: "dls_tiled.policy:DiamondOpenPolicyAgentAuthorizationPolicy"
+  args:
+    authorization_provider: "http://localhost:8181/v1/data/diamond/policy/"
+    token_audience: account
