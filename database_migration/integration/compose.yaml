@@ -18,7 +18,7 @@ services:
       - label=disable
 
   keycloak:
-    image: keycloak/keycloak:26.4
+    image: keycloak/keycloak:26.8
     environment:
       - KC_BOOTSTRAP_ADMIN_PASSWORD=admin
       - KC_BOOTSTRAP_ADMIN_USERNAME=admin
