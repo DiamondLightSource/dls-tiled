@@ -37,7 +37,7 @@ services:
 
   # Started by the test once it has written opa_data/data.json from the dump.
   opa:
-    image: openpolicyagent/opa:1.21.3-static-debug  # debug: entrypoint.sh needs a shell
+    image: openpolicyagent/opa:1.21.4-static-debug  # debug: entrypoint.sh needs a shell
     network_mode: host # Port 8181
     volumes:
       - ./opa:/mnt
