@@ -51,6 +51,9 @@ jobs:
       contents: read
       packages: write
 
+  trivy:
+    uses: ./.github/workflows/_trivy.yml
+
   helm:
     # The chart's default image is the one container pushes for the same tag
     needs: [test, container]
