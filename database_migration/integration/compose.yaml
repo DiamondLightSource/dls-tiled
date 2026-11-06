@@ -55,6 +55,6 @@ services:
     network_mode: host # Port 8407
     volumes:
       - ./tiled_config:/deploy/config:ro
-    command: ["tiled", "serve", "config", "/deploy/config", "--host", "0.0.0.0", "--port", "8407"]
+    command: ["dls-tiled", "serve", "config", "/deploy/config", "--host", "0.0.0.0", "--port", "8407"]
     security_opt:
       - label=disable

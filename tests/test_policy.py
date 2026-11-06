@@ -15,6 +15,7 @@ from tiled.queries import AccessTagsFilter
 from tiled.server.schemas import Principal, PrincipalType
 
 from dls_tiled import policy as policy_module
+from dls_tiled.node_path import request_node_path
 from dls_tiled.policy import (
     SERVICE_ACCOUNT_TAGS_TTL,
     USER_TAGS_TTL,
@@ -76,6 +77,18 @@ def opa(monkeypatch) -> FakeOPA:
 
     monkeypatch.setattr(access_policies.httpx, "AsyncClient", client)
     return fake
+
+
+@pytest.fixture
+def at():
+    """Make the request look like it creates or changes the node at a path,
+    as NodePathMiddleware does. Each async test runs in its own context, so
+    this does not leak into other tests."""
+
+    def set_path(*path: str | None):
+        request_node_path.set(path)
+
+    return set_path
 
 
 # --- build_input: the OPA input document ---------------------------------------
@@ -385,7 +398,8 @@ async def test_init_node_empty_blob_not_public(user, opa):
     assert opa.requests == []
 
 
-async def test_init_node_returns_tags_from_opa(policy, user, opa):
+async def test_init_node_returns_tags_from_opa(policy, user, opa, at):
+    at("i22", "cm1234-5")
     tags = ["i22,cm1234-5"]
     opa.responses[OPA + "tiled/node_tags"] = {"result": tags}
 
@@ -400,7 +414,8 @@ async def test_init_node_returns_tags_from_opa(policy, user, opa):
     ]
 
 
-async def test_init_node_denied(policy, user, opa):
+async def test_init_node_denied(policy, user, opa, at):
+    at("i22", "cm1234-5")
     opa.responses[OPA + "tiled/node_tags"] = {}
 
     with pytest.raises(ValueError, match="Permission denied"):
@@ -419,15 +434,16 @@ async def test_modify_node_identical_blob_skips_opa(policy, user, opa):
     assert opa.requests == []
 
 
-async def test_modify_node_stores_tags_from_opa(policy, user, opa):
+async def test_modify_node_stores_tags_from_opa(policy, user, opa, at):
     # The caller sends a create blob; the node gets OPA's tag, not the blob
-    opa.responses[OPA + "tiled/node_tags"] = {"result": ["i22,cm1-1,t"]}
-    node = SimpleNamespace(access_tags=frozenset(["i22,cm1-1"]))
+    at("i22", "cm1234-5", "processing", "run")
+    opa.responses[OPA + "tiled/node_tags"] = {"result": ["i22,cm1234-5,t"]}
+    node = SimpleNamespace(access_tags=frozenset(["i22,cm1234-5"]))
     new_blob = frozenset([json.dumps({**BLOB_FIELDS, "folder": "processing"})])
 
     result = await policy.modify_node(node, user, None, set(), new_blob)
 
-    assert result == (True, frozenset(["i22,cm1-1,t"]))
+    assert result == (True, frozenset(["i22,cm1234-5,t"]))
     assert opa.requests == [
         (
             OPA + "tiled/node_tags",
@@ -443,7 +459,8 @@ async def test_modify_node_stores_tags_from_opa(policy, user, opa):
     ]
 
 
-async def test_modify_node_to_same_tags_not_modified(policy, user, opa):
+async def test_modify_node_to_same_tags_not_modified(policy, user, opa, at):
+    at("i22", "cm1-1")
     opa.responses[OPA + "tiled/node_tags"] = {"result": ["i22,cm1-1"]}
     node = SimpleNamespace(access_tags=frozenset(["i22,cm1-1"]))
 
@@ -462,13 +479,144 @@ async def test_modify_node_to_same_tags_not_modified(policy, user, opa):
         {"result": False},  # e.g. pointed at a boolean rule
     ],
 )
-async def test_modify_node_denied_raises(policy, user, opa, response):
+async def test_modify_node_denied_raises(policy, user, opa, at, response):
+    at("i22", "cm9-9", "processing")
     # Returning (False, new tags) would still have tiled store the new tags
     opa.responses[OPA + "tiled/node_tags"] = response
     node = SimpleNamespace(access_tags=frozenset(["i22,cm1-1"]))
 
     with pytest.raises(ValueError, match="Permission denied"):
         await policy.modify_node(node, user, None, set(), frozenset(["i22,cm9-9,t"]))
+
+
+# --- tags match the node's place in the tree (envoy routes on it) -----------
+
+
+@pytest.mark.parametrize(
+    "path,tag",
+    [
+        (("i22",), "i22"),
+        (("i22", "cm1-1"), "i22,cm1-1"),
+        (("i22", "cm1-1", "raw"), "i22,cm1-1"),
+        (("i22", "cm1-1", "raw", "run", "primary"), "i22,cm1-1"),
+        (("i22", "cm1-1", "processed", "x"), "i22,cm1-1,p"),
+        (("i22", "cm1-1", "processing", None), "i22,cm1-1,t"),
+    ],
+)
+async def test_init_node_tag_follows_path(policy, user, opa, at, path, tag):
+    at(*path)
+    fields = policy_module._parse_tag(tag)
+    opa.responses[OPA + "tiled/node_tags"] = {"result": [tag]}
+
+    result = await policy.init_node(user, None, set(), frozenset([json.dumps(fields)]))
+
+    assert result == (True, frozenset([tag]))
+    assert opa.requests[0][1]["input"] == {
+        "audience": AUDIENCE,
+        "token": "the-token",
+        **fields,
+    }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        (),  # the root
+        (None,),  # no key given, tiled would make one up
+        ("i22", None),
+        ("i22", "cm1-1", None),
+        ("i22", "CM1-1"),  # the tag writes the visit in lower case
+        ("i22", "cm1-1", "elsewhere"),
+        ("i22", "not-a-visit"),
+        ("22",),
+        ("i22,cm1-1",),
+    ],
+)
+async def test_init_node_nowhere_for_a_node(policy, user, opa, at, path):
+    at(*path)
+
+    with pytest.raises(ValueError, match="No Diamond node can go"):
+        await policy.init_node(user, None, set(), frozenset(['{"instrument": "i22"}']))
+    assert opa.requests == []
+
+
+@pytest.mark.parametrize(
+    "path,blob",
+    [
+        # An instrument node named after another instrument
+        (("i11",), {"instrument": "i22"}),
+        # A visit under another visit's name
+        (("i22", "cm1-2"), {"instrument": "i22", "instrument_session": "cm1-1"}),
+        # Another instrument's visit
+        (("i11", "cm1-1"), {"instrument": "i22", "instrument_session": "cm1-1"}),
+        # The visit node where an instrument node belongs
+        (("i22",), {"instrument": "i22", "instrument_session": "cm1-1"}),
+        # Another folder's tag
+        (
+            ("i22", "cm1-1", "raw", "run"),
+            {
+                "instrument": "i22",
+                "instrument_session": "cm1-1",
+                "folder": "processing",
+            },
+        ),
+        # Another visit's folder
+        (
+            ("i22", "cm1-1", "processing"),
+            {
+                "instrument": "i22",
+                "instrument_session": "cm1-2",
+                "folder": "processing",
+            },
+        ),
+    ],
+)
+async def test_init_node_tags_must_match_path(policy, user, opa, at, path, blob):
+    at(*path)
+
+    with pytest.raises(ValueError, match="do not match the node's place"):
+        await policy.init_node(user, None, set(), frozenset([json.dumps(blob)]))
+    assert opa.requests == []
+
+
+async def test_init_node_existing_tag_or_upper_case_visit_matches(
+    policy, user, opa, at
+):
+    at("i22", "cm1-1", "processed")
+    opa.responses[OPA + "tiled/node_tags"] = {"result": ["i22,cm1-1,p"]}
+
+    for tag in (
+        "i22,cm1-1,p",
+        '{"instrument": "i22", "instrument_session": "CM1-1", "folder": "processed"}',
+    ):
+        assert await policy.init_node(user, None, set(), frozenset([tag])) == (
+            True,
+            frozenset(["i22,cm1-1,p"]),
+        )
+
+
+async def test_init_node_rejects_opa_tag_not_matching_path(policy, user, opa, at):
+    at("i22", "cm1-1", "processing")
+    opa.responses[OPA + "tiled/node_tags"] = {"result": ["i22,cm1-2,t"]}
+
+    with pytest.raises(ValueError, match="as its place in the tree needs"):
+        await policy.init_node(user, None, set(), frozenset(["i22,cm1-1,t"]))
+
+
+async def test_init_node_without_path_refused(policy, user, opa):
+    # e.g. served with plain `tiled serve`, without the middleware
+    with pytest.raises(ValueError, match="dls-tiled serve"):
+        await policy.init_node(user, None, set(), frozenset([BLOB_TAG]))
+    assert opa.requests == []
+
+
+async def test_modify_node_cannot_move_to_another_folder(policy, user, opa, at):
+    at("i22", "cm1-1", "raw", "run")
+    node = SimpleNamespace(access_tags=frozenset(["i22,cm1-1"]))
+
+    with pytest.raises(ValueError, match="do not match the node's place"):
+        await policy.modify_node(node, user, None, set(), frozenset(["i22,cm1-1,t"]))
+    assert opa.requests == []
 
 
 # --- allowed_scopes (inherited from ExternalPolicyDecisionPoint) ---------------

@@ -34,6 +34,8 @@ from tiled.queries import AccessTagsFilter
 from tiled.server.schemas import Principal, PrincipalType
 from tiled.type_aliases import AccessTags, Filters, Scopes
 
+from .node_path import request_node_path
+
 logger = logging.getLogger(__name__)
 
 # How long a caller's user_tags answer is reused before OPA is asked again,
@@ -115,6 +117,90 @@ def _node_fields(access_tags: AccessTags | tuple[()]) -> dict[str, str]:
     return {}
 
 
+def _canonical(fields: dict[str, str]) -> dict[str, str]:
+    """Node fields as a tag records them: raw is the default folder and the
+    visit is lower case."""
+    fields = dict(fields)
+    if fields.get("folder") == "raw":
+        del fields["folder"]
+    if session := fields.get("instrument_session"):
+        fields["instrument_session"] = session.lower()
+    return fields
+
+
+_FOLDER_TO_TAG_SUFFIX = {folder: s for s, folder in _TAG_SUFFIX_TO_FOLDER.items()}
+
+
+def _tag_for(fields: dict[str, str]) -> str:
+    """The tag tiled.rego gives a node with these canonical fields."""
+    tag = fields["instrument"]
+    if session := fields.get("instrument_session"):
+        tag += f",{session}"
+    if folder := fields.get("folder"):
+        tag += f",{_FOLDER_TO_TAG_SUFFIX[folder]}"
+    return tag
+
+
+def _show(path: tuple[str | None, ...]) -> str:
+    return "/" + "/".join(segment or "<new key>" for segment in path)
+
+
+def _path_fields(path: tuple[str | None, ...]) -> dict[str, str]:
+    """The node fields a node's place in the tree gives it:
+
+        <instrument>                        {instrument}
+        <instrument>/<visit>                {instrument, instrument_session}
+        <instrument>/<visit>/<folder>/...   {..., folder} (raw left out)
+
+    Envoy routes requests on the instrument in the path, so a node's tag has
+    to name the instrument and visit it is under. Raises ValueError for any
+    other place, e.g. the root, an unknown folder or an upper case visit.
+    """
+    head = path[:3]
+    if not head or None in head:
+        raise ValueError(f"No Diamond node can go at {_show(path)}")
+    if len(head) == 3 and head[2] not in _FOLDER_TO_TAG_SUFFIX | {"raw": ""}:
+        raise ValueError(
+            f"No Diamond node can go at {_show(path)}: the folders of a"
+            " visit are raw, processed and processing"
+        )
+    names = ("instrument", "instrument_session", "folder")
+    fields = _canonical({name: str(s) for name, s in zip(names, head, strict=False)})
+    # The path must read exactly as the tag will, e.g. a lower case visit
+    if _parse_tag(_tag_for(fields)) != fields or (
+        len(head) > 1 and fields["instrument_session"] != head[1]
+    ):
+        raise ValueError(f"No Diamond node can go at {_show(path)}")
+    return fields
+
+
+def _request_path_fields(access_tags: AccessTags | None) -> dict[str, str]:
+    """The node fields of the node this request creates or changes, from its
+    path, checking that any Diamond tag the caller sent agrees with them."""
+    path = request_node_path.get()
+    if path is None:
+        raise ValueError("The node's path is unknown: serve with `dls-tiled serve`")
+    fields = _path_fields(path)
+    asked = [f for tag in access_tags or () if (f := _tag_fields(tag))]
+    if any(_canonical(f) != fields for f in asked):
+        raise ValueError(
+            f"Access tags {sorted(access_tags or ())} do not match the node's"
+            f" place in the tree, {_show(path)}, which needs {_tag_for(fields)!r}"
+        )
+    return fields
+
+
+def _checked_tags(result: list[str], fields: dict[str, str]) -> AccessTags:
+    """OPA's tags for a node, which must be the one tag its path needs."""
+    tags = normalize_access_tags(result)
+    if tags != {_tag_for(fields)}:
+        raise ValueError(
+            f"Authorisation gave the node tags {sorted(tags)},"
+            f" not {_tag_for(fields)!r} as its place in the tree needs"
+        )
+    return tags
+
+
 def _tags_ttl(token: str) -> int:
     """How long to cache this token's tags. Reads the JWT payload unverified,
     since tiled has already verified the token; one that can't be read gets the
@@ -184,14 +270,17 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
         _check_principal(principal)
         if access_tags is None and self._empty_access_tags_public is not None:
             return self._empty_access_tags_public, normalize_access_tags()
+        # Ask OPA about the node's place in the tree, not just what it was
+        # sent, so the tag always matches the path envoy routes on
+        fields = _request_path_fields(access_tags)
         decision = await self._get_external_decision(
             self._create_node,
-            self.build_input(principal, authn_access_tags, authn_scopes, access_tags),
+            self._input(principal, fields),
             ResultHolder[list[str]],
         )
         if decision and decision.result is not None:
             # The node's own tag, which build_input reads back
-            return (True, normalize_access_tags(decision.result))
+            return (True, _checked_tags(decision.result, fields))
         raise ValueError("Permission denied not able to add the node")
 
     async def modify_node(
@@ -210,16 +299,19 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
                 f" access_tags is identical: {access_tags}"
             )
             return (False, current)
+        # A node's tag is fixed by its place in the tree, so this can only
+        # restore that tag, e.g. on a node tagged by hand
+        fields = _request_path_fields(access_tags)
         decision = await self._get_external_decision(
             self._modify_node,
-            self.build_input(principal, authn_access_tags, authn_scopes, access_tags),
+            self._input(principal, fields),
             ResultHolder[list[str]],
         )
         # tiled stores whatever tags come back, whatever the bool says, so a
         # refusal has to raise (tiled turns it into a 403), and an approval
         # stores the tags OPA gives rather than the ones the caller sent.
         if decision and decision.result:
-            new = normalize_access_tags(decision.result)
+            new = _checked_tags(decision.result, fields)
             return (new != current, new)
         raise ValueError("Permission denied: not able to change the node's access")
 
@@ -230,6 +322,10 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
         authn_scopes: Scopes,
         access_tags: AccessTags | None = None,
     ) -> str:
+        return self._input(principal, _node_fields(access_tags or ()))
+
+    def _input(self, principal: Principal, fields: dict[str, str]) -> str:
+        """The OPA input for the caller and a node's fields."""
         _input: dict[str, str] = {"audience": self._token_audience}
 
         if (
@@ -239,7 +335,7 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
         ):
             _input["token"] = principal.access_token.get_secret_value()
 
-        _input.update(_node_fields(access_tags or ()))
+        _input.update(fields)
         return json.dumps({"input": _input})
 
     async def filters(

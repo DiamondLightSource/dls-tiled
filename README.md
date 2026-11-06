@@ -92,11 +92,32 @@ e.g. `{"instrument": "i22", "instrument_session": "cm12345-1", "folder": "proces
 (`folder` defaults to `raw`; `{"instrument": "i22"}` alone is the instrument
 node) and OPA replaces it with the node's tag.
 
+A node's tag always matches its path, because the envoy in front of the
+per-instrument tiled pods routes on the instrument in the path: a node tagged
+for `i22` is always under `/i22/`, and one tagged for visit `cm12345-1` under
+`/i22/cm12345-1/`. When a node is created, or its tags changed, the policy works
+out its instrument, visit and folder from where it is in the tree and asks OPA
+about that place. It refuses (403) with no OPA call:
+
+- tags that name another instrument, visit or folder than the node's path
+  (an existing node's tag, e.g. `i22,cm12345-1,t`, is accepted as well as a blob)
+- a node anywhere else: at the root, as a fourth folder of a visit, with a visit
+  key in upper case (tags write it in lower case), or with no key
+- changing a node's tags to anything but the tag its path needs, so a node
+  cannot be moved to another folder by retagging
+
+It also refuses OPA answers other than the one tag the path needs. tiled does
+not tell an access policy where a node is being created, so this needs the
+server started with `dls-tiled serve`, which is `tiled serve` plus a middleware
+that records the node path of each create, register and metadata update
+request (`dls-tiled serve config config.yml --host 0.0.0.0`; the image runs it
+by default). Under plain `tiled serve` the policy refuses to create tagged nodes.
+
 - reading: OPA returns the tags the user may see (`allowed_tags_endpoint`);
   `["*"]` means everything.
 - creating a node: OPA returns the tag to store in the new node's `access_tags`
   (`create_node_endpoint`).
-- changing a node's `access_tags`: OPA returns the tags for the node's new place,
+- changing a node's `access_tags`: OPA returns the tags for the node's place,
   as for creating it, or nothing, which refuses the change with a 403
   (`modify_node_endpoint`, by default the create rule).
 - scopes on a node: OPA returns the allowed scopes (`scopes_endpoint`).

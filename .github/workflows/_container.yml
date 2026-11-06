@@ -43,7 +43,7 @@ jobs:
           docker run -d --name smoke -p 8000:8000 \
             -v ${{ github.workspace }}/tests/container:/deploy/config:ro \
             tag_for_testing \
-            tiled serve config --host 0.0.0.0 --port 8000 --scalable \
+            dls-tiled serve config --host 0.0.0.0 --port 8000 --scalable \
             --log-config /deploy/log_config.yml
           for i in $(seq 60); do curl -sf localhost:8000/healthz && break; sleep 1; done
           # 422 (unknown scan) proves the visr router is mounted; 404 would mean it is not

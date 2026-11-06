@@ -29,9 +29,13 @@ RUN --mount=from=ghcr.io/astral-sh/uv:0.13,source=/uv,target=/bin/uv \
 USER app
 
 # Logging config that also shows the plugin loggers: use with
-# tiled serve config ... --log-config /deploy/log_config.yml
+# dls-tiled serve config ... --log-config /deploy/log_config.yml
 COPY log_config.yml /deploy/log_config.yml
 
 # Check the plugins import and that upstream tiled was left at its release
 RUN python -c "import dls_tiled.visr, dls_tiled.policy, tiled; \
 assert tiled.__version__ == '${TILED_VERSION}', tiled.__version__"
+
+# dls-tiled serve is tiled serve, also telling the Diamond access policy where
+# in the tree each request creates or changes a node
+CMD ["dls-tiled", "serve", "config", "--host", "0.0.0.0", "--port", "8000", "--scalable"]

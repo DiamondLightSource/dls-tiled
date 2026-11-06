@@ -1,6 +1,6 @@
 # tiled's default logging (tiled.server.logging_config.LOGGING_CONFIG) plus the
 # dls_tiled plugin loggers, which otherwise have no handler and drop INFO.
-# Use with: tiled serve config ... --log-config /deploy/log_config.yml
+# Use with: dls-tiled serve config ... --log-config /deploy/log_config.yml
 version: 1
 disable_existing_loggers: false
 filters:
