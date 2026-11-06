@@ -66,17 +66,39 @@ Ported from Hiran Wijesinghe's [visr-tiled](https://github.com/hyperrealist/visr
 
 `dls_tiled.policy:DiamondOpenPolicyAgentAuthorizationPolicy` is a tiled access
 policy that delegates every decision to an [Open Policy Agent](https://www.openpolicyagent.org/)
-server. Each request sends OPA the user's access token and the token audience,
-plus the node's proposal, visit and beamline (from a `{"proposal", "visit",
-"beamline"}` JSON tag in the node's `access_blob`) or its session number (from
-an integer tag). Reading, creating and modifying nodes need a user principal;
-anonymous requests and service principals get a 401.
+server, using the `diamond.tiled` rules in the central authorisation service.
+Each request sends OPA the user's access token and the token audience, plus the
+node's `instrument`, `instrument_session` and `folder`. These come from the
+node's single Diamond tag in its `access_tags`: either a JSON blob a client
+sends when creating a node, or the tag OPA stored on an existing node. tiled
+keeps tags as an unordered set, so a node with more than one Diamond tag sends
+no node fields and gets no write access. Reading, creating
+and modifying nodes need a user principal; anonymous requests and service
+principals get a 401.
+
+The tree and its tags:
+
+```
+<instrument>/                i22                lets callers see the instrument node only
+  <visit>/                   i22,cm12345-1
+    raw/                     i22,cm12345-1      written by the instrument's tiled-writer
+    processed/               i22,cm12345-1,p    written by the processing service account
+    processing/              i22,cm12345-1,t    written by anyone on the visit
+```
+
+Anyone on the visit can read all three folders, and sees the instrument node
+above it. To create a node a client sends one access tag holding a JSON blob,
+e.g. `{"instrument": "i22", "instrument_session": "cm12345-1", "folder": "processing"}`
+(`folder` defaults to `raw`; `{"instrument": "i22"}` alone is the instrument
+node) and OPA replaces it with the node's tag.
 
 - reading: OPA returns the tags the user may see (`allowed_tags_endpoint`);
   `["*"]` means everything.
-- creating a node: OPA returns the tag to store in the new node's `access_blob`
+- creating a node: OPA returns the tag to store in the new node's `access_tags`
   (`create_node_endpoint`).
-- changing a node's `access_blob`: OPA returns a yes/no (`modify_node_endpoint`).
+- changing a node's `access_tags`: OPA returns the tags for the node's new place,
+  as for creating it, or nothing, which refuses the change with a 403
+  (`modify_node_endpoint`, by default the create rule).
 - scopes on a node: OPA returns the allowed scopes (`scopes_endpoint`).
 
 Every argument, with the defaults for the optional ones:
@@ -87,11 +109,11 @@ access_control:
   args:
     authorization_provider: http://opa:8181/v1/data/  # OPA data API base URL
     token_audience: account                           # sent to OPA as "audience"
-    create_node_endpoint: tiled/user_session
-    allowed_tags_endpoint: tiled/user_sessions
+    create_node_endpoint: tiled/node_tags
+    allowed_tags_endpoint: tiled/user_tags
     scopes_endpoint: tiled/scopes
-    modify_node_endpoint: tiled/modify_session
-    empty_access_blob_public: true  # allow creates with access_blob: null without asking OPA
+    modify_node_endpoint: tiled/node_tags
+    empty_access_tags_public: true  # allow creates with no access_tags without asking OPA
     provider: null
 ```
 
@@ -135,7 +157,7 @@ CREATE DATABASE data;
 Then start a throwaway tiled pod, exec into it and create the tables:
 
 ```bash
-kubectl run tiled-init -n tiled-staging --image=ghcr.io/bluesky/tiled:0.2.18 \
+kubectl run tiled-init -n tiled-staging --image=ghcr.io/bluesky/tiled:0.2.21 \
   --restart=Never --command \
   -- sleep infinity
 kubectl exec -it tiled-init -n tiled-staging -- bash

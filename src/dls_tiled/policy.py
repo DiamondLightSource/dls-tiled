@@ -7,10 +7,18 @@ Ported from Zoheb Shaikh's diamond-tiled
 import base64
 import json
 import logging
+import re
 import time
+from typing import Literal, Self
 
 from fastapi import HTTPException
-from pydantic import BaseModel, HttpUrl, TypeAdapter, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    HttpUrl,
+    ValidationError,
+    model_validator,
+)
 from starlette.status import (
     HTTP_401_UNAUTHORIZED,
 )
@@ -20,55 +28,91 @@ from tiled.access_control.access_policies import (
     ExternalPolicyDecisionPoint,
     ResultHolder,
 )
+from tiled.access_control.protocols import normalize_access_tags
 from tiled.adapters.protocols import BaseAdapter
-from tiled.queries import AccessBlobFilter
+from tiled.queries import AccessTagsFilter
 from tiled.server.schemas import Principal, PrincipalType
-from tiled.type_aliases import AccessBlob, AccessTags, Filters, Scopes
+from tiled.type_aliases import AccessTags, Filters, Scopes
 
 logger = logging.getLogger(__name__)
 
-# How long a caller's user_sessions answer is reused before OPA is asked again,
+# How long a caller's user_tags answer is reused before OPA is asked again,
 # so a change in authz takes up to this long to reach tiled. Service accounts
 # (tokens without a fedid, as tiled.rego tells them apart) change rarely.
 USER_TAGS_TTL = 60  # seconds
 SERVICE_ACCOUNT_TAGS_TTL = 450  # seconds, 7.5 minutes
 
 
-class DiamondAccessBlob(BaseModel):
-    """What blueapi asks for when creating a node at each level of the tree.
+Folder = Literal["raw", "processed", "processing"]
 
-    beamline alone for a beamline node, plus proposal for a proposal node,
-    plus visit for a session node.
+
+class DiamondAccessBlob(BaseModel):
+    """What a client (e.g. blueapi) asks for when creating a node: the
+    instrument node, or a folder of a visit (raw by default, which is also the
+    visit node itself).
     """
 
-    beamline: str
-    # The full proposal code, e.g. "cm12345" - tiled.rego strips the leading
-    # letters itself where it needs the bare number.
-    proposal: str | None = None
-    visit: int | None = None
+    model_config = ConfigDict(extra="forbid")
+
+    instrument: str
+    # The full instrument session, e.g. "cm12345-1"
+    instrument_session: str | None = None
+    folder: Folder | None = None
+
+    @model_validator(mode="after")
+    def _folder_needs_session(self) -> Self:
+        if self.folder and not self.instrument_session:
+            raise ValueError("folder needs an instrument_session")
+        return self
 
 
-# Maps a composite access tag's "key" (as produced by tiled.rego's
-# beamline_tag/proposal_tag/session_tag, e.g.
-# "beamline:i22,proposal:12345,session:12345-1") to the corresponding OPA
-# input field. All of these are strings on an existing node's tag - "session"
-# here is the "12345-1" proposal-visit pair, not the internal numeric session
-# id used by modify_session.
-_TAG_KEY_TO_INPUT_FIELD = {
-    "beamline": "beamline",
-    "proposal": "proposal",
-    "session": "session",
-}
+# The tags tiled.rego gives nodes: "<instrument>" for the instrument node,
+# "<instrument>,<visit>" for raw (and the visit node), plus ",p" for processed
+# and ",t" for processing, e.g. "i22,cm12345-1,t".
+_TAG_SUFFIX_TO_FOLDER: dict[str, Folder] = {"p": "processed", "t": "processing"}
 
 
-def _parse_composite_tag(tag: str) -> dict[str, str]:
-    fields: dict[str, str] = {}
-    for part in tag.split(","):
-        key, _, value = part.partition(":")
-        field = _TAG_KEY_TO_INPUT_FIELD.get(key)
-        if field is not None:
-            fields[field] = value
+_TAG_RE = re.compile(
+    r"^(?P<instrument>[A-Za-z][A-Za-z0-9-]*)"
+    r"(?:,(?P<session>[A-Za-z]+[0-9]+-[0-9]+)(?:,(?P<suffix>[pt]))?)?$"
+)
+
+
+def _parse_tag(tag: str) -> dict[str, str]:
+    """The OPA input fields for a tag already on a node, or nothing for a tag
+    that isn't one of ours."""
+    if not (match := _TAG_RE.match(tag)):
+        return {}
+    fields = {"instrument": match["instrument"]}
+    if session := match["session"]:
+        fields["instrument_session"] = session
+    if suffix := match["suffix"]:
+        fields["folder"] = _TAG_SUFFIX_TO_FOLDER[suffix]
     return fields
+
+
+def _tag_fields(tag: str) -> dict[str, str]:
+    try:
+        # A JSON blob a client sends when creating a node
+        blob = DiamondAccessBlob.model_validate_json(tag)
+        return blob.model_dump(exclude_none=True)
+    except ValidationError:
+        # A tag OPA already gave an existing node, e.g. tiled checking scopes
+        # on a node before writing to it
+        return _parse_tag(tag)
+
+
+def _node_fields(access_tags: AccessTags | tuple[()]) -> dict[str, str]:
+    """The OPA input fields for a node's access tags. tiled keeps tags as an
+    unordered set, so this needs exactly one of them to be ours (as tiled.rego
+    gives each node a single tag); anything else sends no node fields and OPA
+    denies writes to the node."""
+    fields = [f for tag in access_tags if (f := _tag_fields(tag))]
+    if len(fields) == 1:
+        return fields[0]
+    if fields:
+        logger.warning("Node has more than one Diamond access tag: %s", access_tags)
+    return {}
 
 
 def _tags_ttl(token: str) -> int:
@@ -107,15 +151,16 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
         self,
         authorization_provider: HttpUrl,
         token_audience: str,
-        create_node_endpoint: str = "tiled/user_session",
-        allowed_tags_endpoint: str = "tiled/user_sessions",
+        create_node_endpoint: str = "tiled/node_tags",
+        allowed_tags_endpoint: str = "tiled/user_tags",
         scopes_endpoint: str = "tiled/scopes",
-        modify_node_endpoint: str = "tiled/modify_session",
-        empty_access_blob_public: bool = True,
+        # Same rule as creating: it returns the tags for the node's new place,
+        # or nothing if the caller may not put it there
+        modify_node_endpoint: str = "tiled/node_tags",
+        empty_access_tags_public: bool = True,
         provider: str | None = None,
     ):
         self._token_audience = token_audience
-        self._type_adapter = TypeAdapter(DiamondAccessBlob | int)
         # access token -> (monotonic expiry, filters)
         self._filters_cache: dict[str, tuple[float, Filters]] = {}
 
@@ -126,7 +171,7 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
             scopes_endpoint=scopes_endpoint,
             provider=provider,
             modify_node_endpoint=modify_node_endpoint,
-            empty_access_blob_public=empty_access_blob_public,
+            empty_access_tags_public=empty_access_tags_public,
         )
 
     async def init_node(
@@ -134,20 +179,19 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
         principal: Principal,
         authn_access_tags: AccessTags | None,
         authn_scopes: Scopes,
-        access_blob: AccessBlob | None = None,
-    ) -> tuple[bool, AccessBlob | None]:
+        access_tags: AccessTags | None = None,
+    ) -> tuple[bool, AccessTags]:
         _check_principal(principal)
-        if access_blob is None and self._empty_access_blob_public is not None:
-            return self._empty_access_blob_public, access_blob
+        if access_tags is None and self._empty_access_tags_public is not None:
+            return self._empty_access_tags_public, normalize_access_tags()
         decision = await self._get_external_decision(
             self._create_node,
-            self.build_input(principal, authn_access_tags, authn_scopes, access_blob),
+            self.build_input(principal, authn_access_tags, authn_scopes, access_tags),
             ResultHolder[list[str]],
         )
         if decision and decision.result is not None:
-            # The node's own tag first (build_input reads tags[0] back), then
-            # its ancestors' grant tags; see Node Tags in tiled.rego.
-            return (True, {"tags": decision.result})
+            # The node's own tag, which build_input reads back
+            return (True, normalize_access_tags(decision.result))
         raise ValueError("Permission denied not able to add the node")
 
     async def modify_node(
@@ -156,32 +200,37 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
         principal: Principal,
         authn_access_tags: AccessTags | None,
         authn_scopes: Scopes,
-        access_blob: AccessBlob | None,
-    ) -> tuple[bool, AccessBlob | None]:
+        access_tags: AccessTags | None,
+    ) -> tuple[bool, AccessTags]:
         _check_principal(principal)
-        if access_blob == node.access_blob:  # type: ignore
+        current = node.access_tags  # type: ignore
+        if access_tags == current:
             logger.info(
-                "Node access_blob not modified;"
-                f" access_blob is identical: {access_blob}"
+                "Node access_tags not modified;"
+                f" access_tags is identical: {access_tags}"
             )
-            return (False, node.access_blob)  # type: ignore
+            return (False, current)
         decision = await self._get_external_decision(
             self._modify_node,
-            self.build_input(principal, authn_access_tags, authn_scopes, access_blob),
-            ResultHolder[bool],
+            self.build_input(principal, authn_access_tags, authn_scopes, access_tags),
+            ResultHolder[list[str]],
         )
-        if decision:
-            return (decision.result, access_blob)
-        raise ValueError("Permission denied not able to add the node")
+        # tiled stores whatever tags come back, whatever the bool says, so a
+        # refusal has to raise (tiled turns it into a 403), and an approval
+        # stores the tags OPA gives rather than the ones the caller sent.
+        if decision and decision.result:
+            new = normalize_access_tags(decision.result)
+            return (new != current, new)
+        raise ValueError("Permission denied: not able to change the node's access")
 
     def build_input(
         self,
         principal: Principal,
         authn_access_tags: AccessTags | None,
         authn_scopes: Scopes,
-        access_blob: AccessBlob | None = None,
+        access_tags: AccessTags | None = None,
     ) -> str:
-        _input: dict[str, str | int] = {"audience": self._token_audience}
+        _input: dict[str, str] = {"audience": self._token_audience}
 
         if (
             isinstance(principal, Principal)
@@ -190,25 +239,7 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
         ):
             _input["token"] = principal.access_token.get_secret_value()
 
-        if (
-            access_blob is not None
-            and "tags" in access_blob
-            and len(access_blob["tags"]) > 0
-        ):
-            tag = access_blob["tags"][0]
-            try:
-                blob = self._type_adapter.validate_json(tag)
-            except ValidationError:
-                # Not a create-request JSON blob - it's a composite tag
-                # already assigned to an existing node (e.g. tiled checking
-                # scopes on a node before reading it).
-                blob = None
-                _input.update(_parse_composite_tag(tag))
-            if isinstance(blob, DiamondAccessBlob):
-                _input.update(blob.model_dump(exclude_none=True))
-            elif isinstance(blob, int):
-                _input["session"] = str(blob)
-
+        _input.update(_node_fields(access_tags or ()))
         return json.dumps({"input": _input})
 
     async def filters(
@@ -239,7 +270,7 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
         if tags.result == ["*"]:
             filters = ALL_ACCESS
         else:
-            filters = [AccessBlobFilter(tags=tags.result, user_id=None)]  # type: ignore
+            filters = [AccessTagsFilter(normalize_access_tags(tags.result))]  # type: ignore
         if token:
             # ponytail: drops expired entries on every miss, O(cached tokens); fine
             # for hundreds of callers, use a TTL cache (e.g. cachetools) if that grows.

@@ -4,14 +4,14 @@ import uuid
 from types import SimpleNamespace
 from typing import Any
 
-import httpx
+import httpx2 as httpx
 import pytest
 from fastapi import HTTPException
 from pydantic import HttpUrl, SecretStr
 from tiled.access_control import access_policies
 from tiled.access_control.access_policies import ALL_ACCESS, NO_ACCESS
 from tiled.config import parse_configs
-from tiled.queries import AccessBlobFilter
+from tiled.queries import AccessTagsFilter
 from tiled.server.schemas import Principal, PrincipalType
 
 from dls_tiled import policy as policy_module
@@ -24,8 +24,8 @@ from dls_tiled.policy import (
 
 OPA = "http://opa.example:8181/v1/data/"
 AUDIENCE = "tiled-audience"
-BLOB_TAG = '{"proposal": "cm1234", "visit": 5, "beamline": "i22"}'
-BLOB_FIELDS = {"proposal": "cm1234", "visit": 5, "beamline": "i22"}
+BLOB_TAG = '{"instrument": "i22", "instrument_session": "cm1234-5"}'
+BLOB_FIELDS = {"instrument": "i22", "instrument_session": "cm1234-5"}
 
 # async tests run on anyio's pytest plugin, which ships with tiled's httpx
 pytestmark = pytest.mark.anyio
@@ -88,48 +88,72 @@ def test_build_input_without_access_blob(policy, user):
 
 
 def test_build_input_with_diamond_access_blob(policy, user):
-    body = json.loads(policy.build_input(user, None, set(), {"tags": [BLOB_TAG]}))
+    body = json.loads(policy.build_input(user, None, set(), frozenset([BLOB_TAG])))
 
     assert body["input"] == {"audience": AUDIENCE, "token": "the-token", **BLOB_FIELDS}
 
 
-@pytest.mark.parametrize(
-    "tag, fields",
-    [
-        ('{"beamline": "i22"}', {"beamline": "i22"}),
-        (
-            '{"beamline": "i22", "proposal": "cm1234"}',
-            {"beamline": "i22", "proposal": "cm1234"},
-        ),
-    ],
-)
-def test_build_input_with_container_blob(policy, user, tag, fields):
-    # Beamline and proposal containers have no visit; absent fields aren't sent.
-    body = json.loads(policy.build_input(user, None, set(), {"tags": [tag]}))
-
-    assert body["input"] == {"audience": AUDIENCE, "token": "the-token", **fields}
-
-
-def test_build_input_with_session_int(policy, user):
-    body = json.loads(policy.build_input(user, None, set(), {"tags": ["98765"]}))
+def test_build_input_with_instrument_blob(policy, user):
+    body = json.loads(
+        policy.build_input(user, None, set(), frozenset(['{"instrument": "i22"}']))
+    )
 
     assert body["input"] == {
         "audience": AUDIENCE,
         "token": "the-token",
-        "session": "98765",
+        "instrument": "i22",
     }
 
 
-def test_build_input_uses_first_tag_only(policy, user):
-    blob = {"tags": ["98765", BLOB_TAG]}
+@pytest.mark.parametrize("folder", ["raw", "processed", "processing"])
+def test_build_input_with_folder_blob(policy, user, folder):
+    tag = json.dumps({**BLOB_FIELDS, "folder": folder})
+
+    body = json.loads(policy.build_input(user, None, set(), frozenset([tag])))
+
+    assert body["input"] == {
+        "audience": AUDIENCE,
+        "token": "the-token",
+        **BLOB_FIELDS,
+        "folder": folder,
+    }
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        '{"instrument": "i22", "folder": "raw"}',  # folder without a session
+        '{"instrument": "i22", "instrument_session": "cm1-1", "folder": "other"}',
+        '{"instrument": "i22", "instrument_session": "cm1-1", "visit": 1}',
+        '{"proposal": "cm1234", "visit": 5, "beamline": "i22"}',  # old blob
+        "98765",  # old session id tag
+    ],
+)
+def test_build_input_ignores_invalid_blob(policy, user, tag):
+    body = json.loads(policy.build_input(user, None, set(), frozenset([tag])))
+
+    assert body["input"] == {"audience": AUDIENCE, "token": "the-token"}
+
+
+def test_build_input_ignores_other_tags(policy, user):
+    blob = frozenset(["i22,cm1-1,t", "user:alice"])
 
     body = json.loads(policy.build_input(user, None, set(), blob))
 
-    assert body["input"]["session"] == "98765"
-    assert "proposal" not in body["input"]
+    assert body["input"]["instrument_session"] == "cm1-1"
+    assert body["input"]["folder"] == "processing"
 
 
-@pytest.mark.parametrize("blob", [{}, {"tags": []}, {"user": "someone"}])
+def test_build_input_sends_no_node_fields_for_two_of_our_tags(policy, user):
+    # tiled's tags are unordered, so there is no telling which one to use
+    blob = frozenset(["i22,cm1-1,t", BLOB_TAG])
+
+    body = json.loads(policy.build_input(user, None, set(), blob))
+
+    assert body["input"] == {"audience": AUDIENCE, "token": "the-token"}
+
+
+@pytest.mark.parametrize("blob", [None, frozenset()])
 def test_build_input_ignores_blob_without_tags(policy, user, blob):
     body = json.loads(policy.build_input(user, None, set(), blob))
 
@@ -139,40 +163,72 @@ def test_build_input_ignores_blob_without_tags(policy, user, blob):
 @pytest.mark.parametrize(
     "tag, fields",
     [
-        ("beamline:i22", {"beamline": "i22"}),
-        ("beamline:i22,proposal:12345", {"beamline": "i22", "proposal": "12345"}),
+        ("i22", {"instrument": "i22"}),
+        ("i22,cm12345-1", {"instrument": "i22", "instrument_session": "cm12345-1"}),
         (
-            "beamline:i22,proposal:12345,session:12345-1",
-            {"beamline": "i22", "proposal": "12345", "session": "12345-1"},
+            "i22,cm12345-1,p",
+            {
+                "instrument": "i22",
+                "instrument_session": "cm12345-1",
+                "folder": "processed",
+            },
         ),
-        ("beamline:i22,unknown:x", {"beamline": "i22"}),
+        (
+            "b07-1,cm12345-1,t",
+            {
+                "instrument": "b07-1",
+                "instrument_session": "cm12345-1",
+                "folder": "processing",
+            },
+        ),
     ],
 )
-def test_build_input_with_composite_tag(policy, user, tag, fields):
-    body = json.loads(policy.build_input(user, None, set(), {"tags": [tag]}))
+def test_build_input_with_node_tag(policy, user, tag, fields):
+    body = json.loads(policy.build_input(user, None, set(), frozenset([tag])))
 
     assert body["input"] == {"audience": AUDIENCE, "token": "the-token", **fields}
 
 
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "i22,cm12345-1,x",
+        "i22,cm12345-1,p,t",
+        "i22,12345-1",
+        ",cm12345-1",
+        "beamline:i22,proposal:12345,session:12345-1",  # old tag
+        '{"instrument": "i22", "x": 1}',
+    ],
+)
+def test_build_input_ignores_unknown_tag(policy, user, tag):
+    body = json.loads(policy.build_input(user, None, set(), frozenset([tag])))
+
+    assert body["input"] == {"audience": AUDIENCE, "token": "the-token"}
+
+
 def test_build_input_ignores_unparseable_tag(policy, user):
-    blob = {"tags": ['{"proposal": 1}']}
+    blob = frozenset(['{"proposal": 1}'])
 
     body = json.loads(policy.build_input(user, None, set(), blob))
 
     assert body["input"] == {"audience": AUDIENCE, "token": "the-token"}
 
 
-async def test_allowed_scopes_on_migrated_node(policy, user, opa):
-    # tiled sends a node's own tag when reading it; this used to raise.
+async def test_allowed_scopes_on_existing_node(policy, user, opa):
+    # tiled sends a node's own tag when checking scopes on it
     opa.responses[f"{OPA}tiled/scopes"] = {"result": ["read:metadata"]}
-    node = SimpleNamespace(
-        access_blob={"tags": ["beamline:i22,proposal:12345,session:12345-1"]}
-    )
+    node = SimpleNamespace(access_tags=frozenset(["i22,cm12345-1,t"]))
 
     scopes = await policy.allowed_scopes(node, user, None, set())
 
     assert scopes == {"read:metadata"}
-    assert opa.requests[0][1]["input"]["session"] == "12345-1"
+    assert opa.requests[0][1]["input"] == {
+        "audience": AUDIENCE,
+        "token": "the-token",
+        "instrument": "i22",
+        "instrument_session": "cm12345-1",
+        "folder": "processing",
+    }
 
 
 def test_build_input_omits_token_when_absent(policy):
@@ -224,7 +280,7 @@ async def test_filters_rejects_service_principal(policy, opa):
 
 async def test_init_node_rejects_missing_principal(policy, opa):
     with pytest.raises(HTTPException) as exc:
-        await policy.init_node(None, None, set(), {"tags": [BLOB_TAG]})  # type: ignore
+        await policy.init_node(None, None, set(), frozenset([BLOB_TAG]))  # type: ignore
 
     assert exc.value.status_code == 401
     assert opa.requests == []
@@ -234,27 +290,27 @@ async def test_init_node_rejects_missing_principal(policy, opa):
 
 
 async def test_filters_with_tags(policy, user, opa):
-    opa.responses[OPA + "tiled/user_sessions"] = {"result": ["1", "2"]}
+    opa.responses[OPA + "tiled/user_tags"] = {"result": ["1", "2"]}
 
     filters = await policy.filters(None, user, None, set(), {"read:metadata"})
 
-    assert filters == [AccessBlobFilter(tags=["1", "2"], user_id=None)]
+    assert filters == [AccessTagsFilter(frozenset(["1", "2"]))]  # pyright: ignore[reportArgumentType]
     assert opa.requests == [
         (
-            OPA + "tiled/user_sessions",
+            OPA + "tiled/user_tags",
             {"input": {"audience": AUDIENCE, "token": "the-token"}},
         )
     ]
 
 
 async def test_filters_wildcard_is_all_access(policy, user, opa):
-    opa.responses[OPA + "tiled/user_sessions"] = {"result": ["*"]}
+    opa.responses[OPA + "tiled/user_tags"] = {"result": ["*"]}
 
     assert await policy.filters(None, user, None, set(), set()) is ALL_ACCESS
 
 
 async def test_filters_without_result_is_no_access(policy, user, opa):
-    opa.responses[OPA + "tiled/user_sessions"] = {}
+    opa.responses[OPA + "tiled/user_tags"] = {}
 
     assert await policy.filters(None, user, None, set(), set()) is NO_ACCESS
 
@@ -275,13 +331,13 @@ def clock(monkeypatch) -> list[float]:
     "token, ttl",
     [
         (jwt({"fedid": "abc12345"}), USER_TAGS_TTL),
-        (jwt({"fedid": "abc12345", "beamline": "i22"}), USER_TAGS_TTL),
-        (jwt({"beamline": "i22"}), SERVICE_ACCOUNT_TAGS_TTL),
+        (jwt({"fedid": "abc12345", "instrument": "i22"}), USER_TAGS_TTL),
+        (jwt({"instrument": "i22"}), SERVICE_ACCOUNT_TAGS_TTL),
         ("not-a-jwt", USER_TAGS_TTL),  # unreadable: the shorter TTL
     ],
 )
 async def test_filters_cached_until_ttl(policy, opa, clock, token, ttl):
-    opa.responses[OPA + "tiled/user_sessions"] = {"result": ["beamline:i22"]}
+    opa.responses[OPA + "tiled/user_tags"] = {"result": ["i22,cm1-1"]}
     user = make_principal(token=token)
 
     first = await policy.filters(None, user, None, set(), set())
@@ -294,7 +350,7 @@ async def test_filters_cached_until_ttl(policy, opa, clock, token, ttl):
 
 
 async def test_filters_cache_is_per_token(policy, opa, clock):
-    opa.responses[OPA + "tiled/user_sessions"] = {"result": ["beamline:i22"]}
+    opa.responses[OPA + "tiled/user_tags"] = {"result": ["i22,cm1-1"]}
 
     for token in ("token-a", "token-b"):
         await policy.filters(None, make_principal(token=token), None, set(), set())
@@ -303,10 +359,10 @@ async def test_filters_cache_is_per_token(policy, opa, clock):
 
 
 async def test_filters_no_result_not_cached(policy, user, opa, clock):
-    opa.responses[OPA + "tiled/user_sessions"] = {}
+    opa.responses[OPA + "tiled/user_tags"] = {}
     assert await policy.filters(None, user, None, set(), set()) is NO_ACCESS
 
-    opa.responses[OPA + "tiled/user_sessions"] = {"result": ["*"]}
+    opa.responses[OPA + "tiled/user_tags"] = {"result": ["*"]}
     assert await policy.filters(None, user, None, set(), set()) is ALL_ACCESS
 
 
@@ -314,7 +370,7 @@ async def test_filters_no_result_not_cached(policy, user, opa, clock):
 
 
 async def test_init_node_empty_blob_public_skips_opa(policy, user, opa):
-    assert await policy.init_node(user, None, set(), None) == (True, None)
+    assert await policy.init_node(user, None, set(), None) == (True, frozenset())
     assert opa.requests == []
 
 
@@ -322,74 +378,97 @@ async def test_init_node_empty_blob_not_public(user, opa):
     policy = DiamondOpenPolicyAgentAuthorizationPolicy(
         authorization_provider=HttpUrl(OPA),
         token_audience=AUDIENCE,
-        empty_access_blob_public=False,
+        empty_access_tags_public=False,
     )
 
-    assert await policy.init_node(user, None, set(), None) == (False, None)
+    assert await policy.init_node(user, None, set(), None) == (False, frozenset())
     assert opa.requests == []
 
 
 async def test_init_node_returns_tags_from_opa(policy, user, opa):
-    # the session's own tag first, then its ancestors' grant tags
-    tags = [
-        "beamline:i22,proposal:1234,session:1234-5",
-        "beamline:i22,proposal:1234",
-        "beamline:i22",
-    ]
-    opa.responses[OPA + "tiled/user_session"] = {"result": tags}
+    tags = ["i22,cm1234-5"]
+    opa.responses[OPA + "tiled/node_tags"] = {"result": tags}
 
-    result = await policy.init_node(user, None, set(), {"tags": [BLOB_TAG]})
+    result = await policy.init_node(user, None, set(), frozenset([BLOB_TAG]))
 
-    assert result == (True, {"tags": tags})
+    assert result == (True, frozenset(tags))
     assert opa.requests == [
         (
-            OPA + "tiled/user_session",
+            OPA + "tiled/node_tags",
             {"input": {"audience": AUDIENCE, "token": "the-token", **BLOB_FIELDS}},
         )
     ]
 
 
 async def test_init_node_denied(policy, user, opa):
-    opa.responses[OPA + "tiled/user_session"] = {}
+    opa.responses[OPA + "tiled/node_tags"] = {}
 
     with pytest.raises(ValueError, match="Permission denied"):
-        await policy.init_node(user, None, set(), {"tags": [BLOB_TAG]})
+        await policy.init_node(user, None, set(), frozenset([BLOB_TAG]))
 
 
 # --- modify_node ---------------------------------------------------------------
 
 
 async def test_modify_node_identical_blob_skips_opa(policy, user, opa):
-    node = SimpleNamespace(access_blob={"tags": ["1"]})
+    node = SimpleNamespace(access_tags=frozenset(["1"]))
 
-    result = await policy.modify_node(node, user, None, set(), {"tags": ["1"]})
+    result = await policy.modify_node(node, user, None, set(), frozenset(["1"]))
 
-    assert result == (False, {"tags": ["1"]})
+    assert result == (False, frozenset(["1"]))
     assert opa.requests == []
 
 
-@pytest.mark.parametrize("allowed", [True, False])
-async def test_modify_node_asks_opa(policy, user, opa, allowed):
-    opa.responses[OPA + "tiled/modify_session"] = {"result": allowed}
-    node = SimpleNamespace(access_blob={"tags": ["1"]})
+async def test_modify_node_stores_tags_from_opa(policy, user, opa):
+    # The caller sends a create blob; the node gets OPA's tag, not the blob
+    opa.responses[OPA + "tiled/node_tags"] = {"result": ["i22,cm1-1,t"]}
+    node = SimpleNamespace(access_tags=frozenset(["i22,cm1-1"]))
+    new_blob = frozenset([json.dumps({**BLOB_FIELDS, "folder": "processing"})])
 
-    result = await policy.modify_node(node, user, None, set(), {"tags": ["2"]})
+    result = await policy.modify_node(node, user, None, set(), new_blob)
 
-    assert result == (allowed, {"tags": ["2"]})
+    assert result == (True, frozenset(["i22,cm1-1,t"]))
     assert opa.requests == [
         (
-            OPA + "tiled/modify_session",
-            {"input": {"audience": AUDIENCE, "token": "the-token", "session": "2"}},
+            OPA + "tiled/node_tags",
+            {
+                "input": {
+                    "audience": AUDIENCE,
+                    "token": "the-token",
+                    **BLOB_FIELDS,
+                    "folder": "processing",
+                }
+            },
         )
     ]
 
 
-async def test_modify_node_denied(policy, user, opa):
-    opa.responses[OPA + "tiled/modify_session"] = {"result": "not-a-bool"}
-    node = SimpleNamespace(access_blob={"tags": ["1"]})
+async def test_modify_node_to_same_tags_not_modified(policy, user, opa):
+    opa.responses[OPA + "tiled/node_tags"] = {"result": ["i22,cm1-1"]}
+    node = SimpleNamespace(access_tags=frozenset(["i22,cm1-1"]))
+
+    result = await policy.modify_node(
+        node, user, None, set(), frozenset([BLOB_TAG.replace("cm1234-5", "cm1-1")])
+    )
+
+    assert result == (False, frozenset(["i22,cm1-1"]))
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {},  # OPA said nothing: the rule is undefined for this caller
+        {"result": []},
+        {"result": False},  # e.g. pointed at a boolean rule
+    ],
+)
+async def test_modify_node_denied_raises(policy, user, opa, response):
+    # Returning (False, new tags) would still have tiled store the new tags
+    opa.responses[OPA + "tiled/node_tags"] = response
+    node = SimpleNamespace(access_tags=frozenset(["i22,cm1-1"]))
 
     with pytest.raises(ValueError, match="Permission denied"):
-        await policy.modify_node(node, user, None, set(), {"tags": ["2"]})
+        await policy.modify_node(node, user, None, set(), frozenset(["i22,cm9-9,t"]))
 
 
 # --- allowed_scopes (inherited from ExternalPolicyDecisionPoint) ---------------
@@ -397,7 +476,7 @@ async def test_modify_node_denied(policy, user, opa):
 
 async def test_allowed_scopes_sends_node_blob(policy, user, opa):
     opa.responses[OPA + "tiled/scopes"] = {"result": ["read:metadata", "read:data"]}
-    node = SimpleNamespace(access_blob={"tags": [BLOB_TAG]})
+    node = SimpleNamespace(access_tags=frozenset([BLOB_TAG]))
 
     scopes = await policy.allowed_scopes(node, user, None, set())
 
@@ -432,7 +511,7 @@ access_control:
     allowed_tags_endpoint: tiled/tags
     scopes_endpoint: tiled/node_scopes
     modify_node_endpoint: tiled/modify
-    empty_access_blob_public: false
+    empty_access_tags_public: false
     provider: diamond
 trees:
   - path: /
@@ -449,5 +528,5 @@ trees:
     assert policy._user_tags == OPA + "tiled/tags"
     assert policy._node_scopes == OPA + "tiled/node_scopes"
     assert policy._modify_node == OPA + "tiled/modify"
-    assert policy._empty_access_blob_public is False
+    assert policy._empty_access_tags_public is False
     assert policy._provider == "diamond"
