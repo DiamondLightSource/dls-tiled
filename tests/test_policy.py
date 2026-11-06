@@ -15,7 +15,7 @@ from tiled.queries import AccessTagsFilter
 from tiled.server.schemas import Principal, PrincipalType
 
 from dls_tiled import policy as policy_module
-from dls_tiled.node_path import request_node_path
+from dls_tiled.node_path import request_node_path, request_seen
 from dls_tiled.policy import (
     SERVICE_ACCOUNT_TAGS_TTL,
     USER_TAGS_TTL,
@@ -89,6 +89,13 @@ def at():
         request_node_path.set(path)
 
     return set_path
+
+
+def outside_tree():
+    """Make the request look like one outside the tree, e.g. GraphQL, which
+    the middleware sees but records no node path for. Call it in the test:
+    each async test runs in its own context."""
+    request_seen.set(True)
 
 
 # --- build_input: the OPA input document ---------------------------------------
@@ -383,6 +390,7 @@ async def test_filters_no_result_not_cached(policy, user, opa, clock):
 
 
 async def test_init_node_empty_blob_public_skips_opa(policy, user, opa):
+    outside_tree()
     assert await policy.init_node(user, None, set(), None) == (True, frozenset())
     assert opa.requests == []
 
@@ -393,6 +401,7 @@ async def test_init_node_empty_blob_not_public(user, opa):
         token_audience=AUDIENCE,
         empty_access_tags_public=False,
     )
+    outside_tree()
 
     assert await policy.init_node(user, None, set(), None) == (False, frozenset())
     assert opa.requests == []
@@ -601,6 +610,50 @@ async def test_init_node_rejects_opa_tag_not_matching_path(policy, user, opa, at
 
     with pytest.raises(ValueError, match="as its place in the tree needs"):
         await policy.init_node(user, None, set(), frozenset(["i22,cm1-1,t"]))
+
+
+async def test_init_node_without_tags_in_tree_gets_path_tag(policy, user, opa, at):
+    # An untagged node would not match its path, so it is tagged anyway
+    at("i22", "cm1-1", "processing", "x")
+    opa.responses[OPA + "tiled/node_tags"] = {"result": ["i22,cm1-1,t"]}
+
+    result = await policy.init_node(user, None, set(), None)
+
+    assert result == (True, frozenset(["i22,cm1-1,t"]))
+    assert opa.requests[0][1]["input"]["folder"] == "processing"
+
+
+async def test_init_node_without_tags_at_root_refused(policy, user, opa, at):
+    at("not-an-instrument", "x", "y")
+
+    with pytest.raises(ValueError, match="No Diamond node can go"):
+        await policy.init_node(user, None, set(), None)
+
+
+async def test_init_node_outside_tree_tagged_from_blob(policy, user, opa):
+    # e.g. a GraphQL entity: no path to match, OPA tags it from the blob
+    outside_tree()
+    opa.responses[OPA + "tiled/node_tags"] = {"result": ["i22,cm1234-5"]}
+
+    result = await policy.init_node(user, None, set(), frozenset([BLOB_TAG]))
+
+    assert result == (True, frozenset(["i22,cm1234-5"]))
+    assert opa.requests[0][1]["input"] == {
+        "audience": AUDIENCE,
+        "token": "the-token",
+        **BLOB_FIELDS,
+    }
+
+
+async def test_modify_node_outside_tree_tagged_from_blob(policy, user, opa):
+    outside_tree()
+    opa.responses[OPA + "tiled/node_tags"] = {"result": ["i22,cm1234-5,t"]}
+    node = SimpleNamespace(access_tags=frozenset(["i22,cm1234-5"]))
+    blob = frozenset([json.dumps({**BLOB_FIELDS, "folder": "processing"})])
+
+    result = await policy.modify_node(node, user, None, set(), blob)
+
+    assert result == (True, frozenset(["i22,cm1234-5,t"]))
 
 
 async def test_init_node_without_path_refused(policy, user, opa):

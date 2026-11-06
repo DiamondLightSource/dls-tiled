@@ -34,7 +34,7 @@ from tiled.queries import AccessTagsFilter
 from tiled.server.schemas import Principal, PrincipalType
 from tiled.type_aliases import AccessTags, Filters, Scopes
 
-from .node_path import request_node_path
+from .node_path import request_node_path, request_seen
 
 logger = logging.getLogger(__name__)
 
@@ -174,11 +174,15 @@ def _path_fields(path: tuple[str | None, ...]) -> dict[str, str]:
     return fields
 
 
-def _request_path_fields(access_tags: AccessTags | None) -> dict[str, str]:
-    """The node fields of the node this request creates or changes, from its
-    path, checking that any Diamond tag the caller sent agrees with them."""
+def _request_path_fields(access_tags: AccessTags | None) -> dict[str, str] | None:
+    """The node fields of the tree node this request creates or changes, from
+    its path, checking that any Diamond tag the caller sent agrees with them.
+    None for things outside the tree, such as the entities and links of
+    tiled's GraphQL API, which envoy does not route by path."""
     path = request_node_path.get()
     if path is None:
+        if request_seen.get():
+            return None
         raise ValueError("The node's path is unknown: serve with `dls-tiled serve`")
     fields = _path_fields(path)
     asked = [f for tag in access_tags or () if (f := _tag_fields(tag))]
@@ -190,10 +194,11 @@ def _request_path_fields(access_tags: AccessTags | None) -> dict[str, str]:
     return fields
 
 
-def _checked_tags(result: list[str], fields: dict[str, str]) -> AccessTags:
-    """OPA's tags for a node, which must be the one tag its path needs."""
+def _result_tags(result: list[str], fields: dict[str, str]) -> AccessTags:
+    """OPA's tags for a node. For a tree node (one with a path) they must be
+    the one tag its path needs."""
     tags = normalize_access_tags(result)
-    if tags != {_tag_for(fields)}:
+    if request_node_path.get() is not None and tags != {_tag_for(fields)}:
         raise ValueError(
             f"Authorisation gave the node tags {sorted(tags)},"
             f" not {_tag_for(fields)!r} as its place in the tree needs"
@@ -268,11 +273,15 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
         access_tags: AccessTags | None = None,
     ) -> tuple[bool, AccessTags]:
         _check_principal(principal)
-        if access_tags is None and self._empty_access_tags_public is not None:
-            return self._empty_access_tags_public, normalize_access_tags()
-        # Ask OPA about the node's place in the tree, not just what it was
-        # sent, so the tag always matches the path envoy routes on
+        # Ask OPA about a tree node's place in the tree, not just what it was
+        # sent, so its tag always matches the path envoy routes on. That holds
+        # with no access tags too: a node left untagged would not match.
         fields = _request_path_fields(access_tags)
+        if fields is None:
+            # Outside the tree: tagged from what the caller sent
+            if access_tags is None and self._empty_access_tags_public is not None:
+                return self._empty_access_tags_public, normalize_access_tags()
+            fields = _node_fields(access_tags or ())
         decision = await self._get_external_decision(
             self._create_node,
             self._input(principal, fields),
@@ -280,7 +289,7 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
         )
         if decision and decision.result is not None:
             # The node's own tag, which build_input reads back
-            return (True, _checked_tags(decision.result, fields))
+            return (True, _result_tags(decision.result, fields))
         raise ValueError("Permission denied not able to add the node")
 
     async def modify_node(
@@ -299,9 +308,11 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
                 f" access_tags is identical: {access_tags}"
             )
             return (False, current)
-        # A node's tag is fixed by its place in the tree, so this can only
-        # restore that tag, e.g. on a node tagged by hand
+        # A tree node's tag is fixed by its place in the tree, so this can
+        # only restore that tag, e.g. on a node tagged by hand
         fields = _request_path_fields(access_tags)
+        if fields is None:
+            fields = _node_fields(access_tags or ())
         decision = await self._get_external_decision(
             self._modify_node,
             self._input(principal, fields),
@@ -311,7 +322,7 @@ class DiamondOpenPolicyAgentAuthorizationPolicy(ExternalPolicyDecisionPoint):
         # refusal has to raise (tiled turns it into a 403), and an approval
         # stores the tags OPA gives rather than the ones the caller sent.
         if decision and decision.result:
-            new = _checked_tags(decision.result, fields)
+            new = _result_tags(decision.result, fields)
             return (new != current, new)
         raise ValueError("Permission denied: not able to change the node's access")
 

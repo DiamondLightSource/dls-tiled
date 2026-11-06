@@ -26,6 +26,10 @@ request_node_path: ContextVar[tuple[str | None, ...] | None] = ContextVar(
     "request_node_path", default=None
 )
 
+# Whether the request went through the middleware at all, so the policy can
+# tell a request outside the tree from a server without the middleware
+request_seen: ContextVar[bool] = ContextVar("request_seen", default=False)
+
 _ROUTE_RE = re.compile(r"/api/v1/(?P<route>metadata|register)/(?P<path>.*)")
 
 # (method, route) -> whether the request creates a child of the path
@@ -81,6 +85,13 @@ class NodePathMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        seen = request_seen.set(True)
+        try:
+            await self._call(scope, receive, send)
+        finally:
+            request_seen.reset(seen)
+
+    async def _call(self, scope: Scope, receive: Receive, send: Send) -> None:
         path = scope["path"]
         root_path = scope.get("root_path", "")
         if root_path and path.startswith(root_path):
@@ -107,6 +118,14 @@ def install(app):
     """Add the middleware to a tiled app, outside tiled's own middleware."""
     app.add_middleware(NodePathMiddleware)
     return app
+
+
+def app_factory():
+    """tiled's app_factory with the middleware installed, for running under
+    uvicorn or gunicorn: uvicorn --factory dls_tiled.node_path:app_factory"""
+    from tiled.server.app import app_factory as tiled_app_factory
+
+    return install(tiled_app_factory())
 
 
 def serve(args: Sequence[str]) -> None:

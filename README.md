@@ -106,12 +106,19 @@ about that place. It refuses (403) with no OPA call:
 - changing a node's tags to anything but the tag its path needs, so a node
   cannot be moved to another folder by retagging
 
+A node created with no access tags gets its path's tag too (if OPA allows),
+rather than being left untagged. The entities and links of tiled's GraphQL API
+are not in the tree, so they are tagged from what the caller sends, as before.
+
 It also refuses OPA answers other than the one tag the path needs. tiled does
 not tell an access policy where a node is being created, so this needs the
 server started with `dls-tiled serve`, which is `tiled serve` plus a middleware
 that records the node path of each create, register and metadata update
 request (`dls-tiled serve config config.yml --host 0.0.0.0`; the image runs it
-by default). Under plain `tiled serve` the policy refuses to create tagged nodes.
+by default). For uvicorn or gunicorn workers, use
+`uvicorn --factory dls_tiled.node_path:app_factory` (with `TILED_CONFIG` set)
+in place of tiled's `app_factory`. Without the middleware the policy refuses
+to create nodes or change their tags.
 
 - reading: OPA returns the tags the user may see (`allowed_tags_endpoint`);
   `["*"]` means everything.
@@ -134,7 +141,7 @@ access_control:
     allowed_tags_endpoint: tiled/user_tags
     scopes_endpoint: tiled/scopes
     modify_node_endpoint: tiled/node_tags
-    empty_access_tags_public: true  # allow creates with no access_tags without asking OPA
+    empty_access_tags_public: true  # outside the tree (GraphQL), allow creates with no access_tags without asking OPA
     provider: null
 ```
 

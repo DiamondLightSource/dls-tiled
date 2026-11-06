@@ -9,7 +9,12 @@ from tiled.client import Context, from_context
 from tiled.server.app import build_app_from_config
 
 from dls_tiled import node_path
-from dls_tiled.node_path import NodePathMiddleware, install, request_node_path
+from dls_tiled.node_path import (
+    NodePathMiddleware,
+    install,
+    request_node_path,
+    request_seen,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -164,8 +169,33 @@ def test_serve_installs_middleware(monkeypatch):
     assert any(m.cls is NodePathMiddleware for m in app.user_middleware)
 
 
-def test_cli_serve_passes_args_to_tiled():
-    cmd = [sys.executable, "-m", "dls_tiled", "serve", "config", "--help"]
+@pytest.mark.parametrize("args", [["config", "--help"], ["--help"]])
+def test_cli_serve_passes_options_to_tiled(args):
+    cmd = [sys.executable, "-m", "dls_tiled", "serve", *args]
     out = subprocess.check_output(cmd).decode()
 
-    assert "dls-tiled serve config" in out
+    assert "Usage: dls-tiled serve" in out
+
+
+def test_app_factory_installs_middleware(tmp_path, monkeypatch):
+    config = tmp_path / "config.yml"
+    config.write_text(
+        "trees:\n  - path: /\n    tree: tiled.examples.generated_minimal:tree\n"
+    )
+    monkeypatch.setenv("TILED_CONFIG", str(config))
+
+    app = node_path.app_factory()
+
+    assert any(m.cls is NodePathMiddleware for m in app.user_middleware)
+
+
+async def test_middleware_marks_every_request_seen():
+    seen = []
+
+    async def app(scope, receive, send):
+        seen.append(request_seen.get())
+
+    await call(NodePathMiddleware(app), "POST", "/api/v1/graphql", b"{}")
+
+    assert seen == [True]
+    assert request_seen.get() is False
