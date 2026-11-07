@@ -9,7 +9,8 @@ authentication:
         # Keycloak tokens have no "scp" claim, so this grants these to all.
         scopes_map:
           read: ["read:metadata", "read:data"]
-        well_known_uri: "http://localhost:8081/realms/master/.well-known/openid-configuration"
+          write: ["write:metadata", "write:data", "create:node", "register"]
+        well_known_uri: "http://localhost:8082/realms/master/.well-known/openid-configuration"
 trees:
   - path: /
     tree: catalog
@@ -19,5 +20,5 @@ trees:
 access_control:
   access_policy: "dls_tiled.policy:DiamondOpenPolicyAgentAuthorizationPolicy"
   args:
-    authorization_provider: "http://localhost:8181/v1/data/diamond/policy/"
+    authorization_provider: "http://localhost:8182/v1/data/diamond/"
     token_audience: account

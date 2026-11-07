@@ -1,7 +1,8 @@
-# Stack for test_integration.py: a production dump is restored into postgres,
-# migrated, then read back through dls-tiled with real Keycloak tokens and the
-# Diamond OPA policy. Ports: postgres 5433, keycloak 8081, opa 8181, tiled 8407.
-# Modelled on blueapi's tests/system_tests/compose.yaml.
+# Stack for test_integration.py: a catalog (seeded, or a production dump) in
+# postgres is migrated, then read back through dls-tiled with real Keycloak
+# tokens and the central authorisation OPA. Its ports (postgres 5433,
+# keycloak 8082, opa 8182, tiled 8408) leave blueapi's system test stack
+# (8081, 8181, 8407) free to run alongside.
 
 services:
   postgres:
@@ -22,12 +23,12 @@ services:
     environment:
       - KC_BOOTSTRAP_ADMIN_PASSWORD=admin
       - KC_BOOTSTRAP_ADMIN_USERNAME=admin
-      - KC_HOSTNAME=http://localhost:8081
+      - KC_HOSTNAME=http://localhost:8082
     command: ["start-dev"]
     ports:
-      - "8081:8080"
+      - "8082:8080"
     healthcheck:
-      test: /opt/keycloak/bin/kcadm.sh config credentials --server http://keycloak:8080 --realm master --user admin --password admin
+      test: /opt/keycloak/bin/kcadm.sh config credentials --server http://localhost:8080 --realm master --user admin --password admin
       interval: 5s
       timeout: 5s
       retries: 20
@@ -35,26 +36,37 @@ services:
     security_opt:
       - label=disable
 
-  # Started by the test once it has written opa_data/data.json from the dump.
+  # Central authorisation OPA (gitlab.diamond.ac.uk/auth-auth/authorisation),
+  # built from a local checkout, with the test data in opa_bundle
   opa:
-    image: openpolicyagent/opa:1.21.4-static-debug  # debug: entrypoint.sh needs a shell
-    network_mode: host # Port 8181
+    build:
+      context: ${AUTHORISATION_REPO:-../../../authorisation}
+    network_mode: host # Port 8182
     volumes:
-      - ./opa:/mnt
+      - ./opa_bundle:/test_bundle:ro
     environment:
-      - ISSUER=http://localhost:8081/realms/master
-    entrypoint: "sh /mnt/entrypoint.sh"
+      - ISSUER=http://localhost:8082/realms/master
+    # The image's entrypoint serves on 8181
+    entrypoint:
+      - opa
+      - run
+      - --server
+      - --addr=:8182
+      - --authorization=basic
+      - --authentication=token
+      - /policies
+      - /test_bundle
     security_opt:
       - label=disable
 
-  # dls-tiled's own image, so its access policy is what gets tested.
+  # dls-tiled's own image, so its access policy is what gets tested
   tiled:
     build:
       context: ../..
       target: runtime
-    network_mode: host # Port 8407
+    network_mode: host # Port 8408
     volumes:
       - ./tiled_config:/deploy/config:ro
-    command: ["dls-tiled", "serve", "config", "/deploy/config", "--host", "0.0.0.0", "--port", "8407"]
+    command: ["dls-tiled", "serve", "config", "/deploy/config", "--host", "0.0.0.0", "--port", "8408"]
     security_opt:
       - label=disable

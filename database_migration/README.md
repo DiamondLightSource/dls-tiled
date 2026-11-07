@@ -2,7 +2,8 @@
 
 Commands to add a read-only role to the tiled Postgres database running in
 Kubernetes, back up every database as that role, and move runs into the
-`beamline/proposal/session` layout.
+`<instrument>/<visit>/{raw,processed,processing}` tree that the central
+authorisation tiled rules expect.
 
 Set these once in your shell:
 
@@ -123,9 +124,11 @@ ls -lh backup
 
 ## 3. Move runs into the new layout
 
-`migrate_node_structure.py` writes to the database, so it runs as the tiled
-owner or `postgres`, not `tiled_readonly`. It connects from your machine, so
-forward the Postgres port first. Leave this running in its own terminal:
+`migrate_to_central_authz.py` writes to the database, so it runs as the tiled
+owner or `postgres`, not `tiled_readonly`. Scale tiled to zero first; the
+script also locks the `nodes` table against writes while it runs. It connects
+from your machine, so forward the Postgres port first. Leave this running in
+its own terminal:
 
 ```bash
 kubectl port-forward -n $NS pod/$POD 5432:5432
@@ -137,33 +140,41 @@ tiled version in the runtime image):
 ```bash
 URI=postgresql://postgres:<password>@localhost:5432/tiled
 
-# Preview: prints what would move and retag, changes nothing
-uv run --script migrate_node_structure.py $URI --dry-run
-
 # Upgrade the tiled schema (to --revision, default head), then move the runs
-uv run --script migrate_node_structure.py $URI --revision head --authz-data data.json
+uv run --script migrate_to_central_authz.py $URI
 ```
 
-`--authz-data` is the authz bundle's `data.json` (in `bundle.tar.gz` from
-authz.diamond.ac.uk, or `GET /v1/data` from an OPA that has it loaded). The
-script uses it for nodes still tagged with a bare numeric session id that it
-can't move, such as runs without `start.instrument_session`: without the data
-they stay tagged with the id, which the current policy never grants, so only
-admins see them. With it they are retagged in place from that session's
-beamline, proposal and visit. They stay at the root, since the data has the
-proposal number but not the code (`cm`) the tree's keys use. The script prints
-how many ids it couldn't find.
+Each run (a node with a start document, not inside another run) goes to
+`<instrument>/<visit>/raw/<run>`, from its start document's `instrument` and
+`instrument_session`, lower cased. That covers both earlier layouts: runs at
+the root, and the old `<beamline>/<proposal>/<session>/<run>` tree. A run in
+the old tree without those fields goes by its path. Runs already in a folder
+of a visit stay where they are. Every visit gets its `raw`, `processed` and
+`processing` folders.
 
-Besides moving runs, it gives nodes already in the tree that carry only their
-own tag (from blueapi under an earlier policy, or an earlier run of this
-script) the full tag list the current policy stamps, so beamline and proposal
-grants reach them. Deploy the matching authz policy with it: under an older
-policy, a session member's beamline tag would match every node on the beamline.
+Every node gets exactly the one tag the rules give its place: `i22` for the
+instrument node, `i22,cm12345-1` for the visit, raw and everything in it, and
+`,p` or `,t` added for processed and processing. Old tags are removed, not
+kept alongside: envoy routes on the path, and dls-tiled refuses writes to a
+node whose tag doesn't match the path. The old tags (bare session ids,
+`beamline:...`, `visible:...`) grant nothing under the new rules anyway.
 
-The dry run only works if the database is already at tiled schema revision
-`e05e918092c3` or later; otherwise it says so, and the real run upgrades it
-first. Running the migration twice is safe: the second run moves and retags
-nothing.
+The old tree's proposal and session containers are deleted once empty. Runs
+the script can't place are left where they are with their tags, and listed:
+no `instrument` or `instrument_session` to go by, or a run of the same key
+already in the folder. Only admins can see them until someone moves them.
+
+`--dry-run` runs the whole migration in a transaction, prints what it did,
+then rolls it back. It skips the schema upgrade, so it only works on a
+database already at tiled revision `0d4e1f2a3b4c` or later; otherwise it
+says so. For a preview of production, restore the backup into a scratch
+database, upgrade that with `tiled catalog upgrade-database`, and dry-run
+there. Running the migration twice is safe: the second run changes nothing.
+
+`test_integration.py` does all of this against a seeded catalog, or a dump
+(`PROD_DUMP=backup/tiled.dump`), then reads it back through dls-tiled,
+Keycloak and the central authorisation OPA. It builds the OPA from a checkout
+of the authorisation repo next to this one (or `AUTHORISATION_REPO`).
 
 ## Restore from the backup (as postgres)
 
