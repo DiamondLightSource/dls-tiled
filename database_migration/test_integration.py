@@ -35,12 +35,19 @@ import json
 import os
 import shlex
 import subprocess
-import sys
+import time
 from pathlib import Path
 
 import httpx
 import pytest
-from migrate_to_central_authz import FOLDERS, find_occupied, find_runs, plan, tag
+from migrate_to_central_authz import (
+    FOLDERS,
+    find_occupied,
+    find_runs,
+    plan,
+    tag,
+    upgrade_schema,
+)
 from sqlalchemy.ext.asyncio import create_async_engine
 
 HERE = Path(__file__).parent
@@ -241,21 +248,34 @@ def make_client(admin: httpx.Client, fedid: str) -> None:
     ).raise_for_status()
 
 
+class ClientCredentials(httpx.Auth):
+    """Fetches a token for the service account, and a new one when it is
+    about to expire: reading back a production dump outlasts one token."""
+
+    def __init__(self, fedid: str):
+        self.fedid = fedid
+        self.token = ""
+        self.expires = 0.0
+
+    def auth_flow(self, request: httpx.Request):
+        if time.monotonic() > self.expires - 10:
+            response = httpx.post(
+                f"{KEYCLOAK}/realms/master/protocol/openid-connect/token",
+                data={
+                    "client_id": f"migration-test-{self.fedid}",
+                    "client_secret": "secret",
+                    "grant_type": "client_credentials",
+                },
+            )
+            response.raise_for_status()
+            self.token = response.json()["access_token"]
+            self.expires = time.monotonic() + response.json()["expires_in"]
+        request.headers["Authorization"] = f"Bearer {self.token}"
+        yield request
+
+
 def tiled_client(fedid: str) -> httpx.Client:
-    token = httpx.post(
-        f"{KEYCLOAK}/realms/master/protocol/openid-connect/token",
-        data={
-            "client_id": f"migration-test-{fedid}",
-            "client_secret": "secret",
-            "grant_type": "client_credentials",
-        },
-    )
-    token.raise_for_status()
-    return httpx.Client(
-        base_url=TILED,
-        headers={"Authorization": f"Bearer {token.json()['access_token']}"},
-        timeout=30,
-    )
+    return httpx.Client(base_url=TILED, auth=ClientCredentials(fedid), timeout=30)
 
 
 def wait_for_tiled() -> None:
@@ -292,10 +312,7 @@ def migrated():
         else:
             seed()
         # A dry run needs the schema upgraded already
-        subprocess.run(
-            [sys.executable, "-m", "tiled", "catalog", "upgrade-database", URI],
-            check=True,
-        )
+        upgrade_schema(URI.replace("postgresql", "postgresql+asyncpg"), "head")
         before = nodes()
         result = asyncio.run(_plan())
         assert result.placed, "the catalog has no runs to place"
@@ -321,7 +338,9 @@ def migrated():
             for fedid in ("admin", "alice"):
                 make_client(admin, fedid)
 
-        compose("up", "-d", "--build", "opa", "tiled")
+        # Recreated, so a tiled kept from an earlier run (KEEP_STACK) does not
+        # serve what it read of the catalog before it was restored
+        compose("up", "-d", "--build", "--force-recreate", "opa", "tiled")
         wait_for_tiled()
         yield before, result, after, (dry, first, second)
     finally:

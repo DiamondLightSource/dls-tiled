@@ -33,7 +33,9 @@ Runs that can't be placed (no instrument or instrument_session to go by, or
 a run of the same key already in the folder) are left where they are, tags
 and all, and listed.
 
-The tiled schema is upgraded first (to --revision, default head). Stop tiled
+The tiled schema is upgraded first (to --revision, default head). Migrations
+whose tables and indexes are in the catalog already, as in production's
+(see MADE_AHEAD), are marked as done rather than run. Stop tiled
 while this runs; it also locks the nodes table against writes. Postgres only.
 Safe to rerun: a second run changes nothing.
 
@@ -49,10 +51,12 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from tiled.access_control.protocols import ApprovedAccessTags
-from tiled.alembic_utils import get_current_revision, upgrade
+from tiled.alembic_utils import get_current_revision, temp_alembic_ini, upgrade
 from tiled.catalog.alembic_constants import ALEMBIC_DIR, ALEMBIC_INI_TEMPLATE_PATH
 from tiled.catalog.core import ALL_REVISIONS, register_tag_rows
 from tiled.utils import ensure_specified_sql_driver
@@ -151,6 +155,49 @@ def plan(runs: list[Run], occupied: set[tuple[Place, str]]) -> Plan:
             occupied.add((where, run.key))
             result.placed.append((run, where))
     return result
+
+
+# Migrations whose tables and indexes a catalog can have already, though its
+# alembic revision is older: (migration, the revision before it, what it
+# makes). Diamond's production catalog is at 4cf6011a8db5 with both of these
+# in it, so upgrading fails making them again. Each is marked as done only
+# when the catalog is at the revision before it and has everything it makes.
+MADE_AHEAD = [
+    ("85a47342e78e", "4cf6011a8db5", ("webhooks", "webhook_deliveries")),
+    ("bf2fe0eb8ee8", "85a47342e78e", ("ix_nodes_parent_id",)),
+]
+
+
+async def relations(uri: str) -> set[str]:
+    """Names of the tables and indexes in the public schema."""
+    engine = create_async_engine(uri)
+    try:
+        async with engine.connect() as conn:
+            rows = await conn.execute(
+                text(
+                    "SELECT c.relname FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = 'public'"
+                )
+            )
+            return set(rows.scalars())
+    finally:
+        await engine.dispose()
+
+
+def upgrade_schema(uri: str, revision: str) -> None:
+    """Upgrade the tiled schema to `revision`, first marking as done any
+    migration whose tables and indexes are there already (see MADE_AHEAD)."""
+    current = asyncio.run(current_revision(uri))
+    for done, before, made in MADE_AHEAD:
+        if current == before and set(made) <= asyncio.run(relations(uri)):
+            print(f"{', '.join(made)} exist already: marking {done} as done")
+            ini, folder = Path(ALEMBIC_INI_TEMPLATE_PATH), Path(ALEMBIC_DIR)
+            with temp_alembic_ini(ini, folder, uri) as alembic_ini:
+                command.stamp(Config(alembic_ini), done)
+            current = done
+    # Alembic runs its own event loop, so this has to sit outside asyncio.run.
+    upgrade(Path(ALEMBIC_INI_TEMPLATE_PATH), Path(ALEMBIC_DIR), uri, revision)
 
 
 async def current_revision(uri: str) -> str | None:
@@ -440,8 +487,7 @@ def main() -> None:
     if (revision := asyncio.run(current_revision(uri))) is None:
         raise SystemExit("Database is not a tiled catalog; run `tiled catalog init`.")
     if not args.dry_run:
-        # Alembic runs its own event loop, so this has to sit outside asyncio.run.
-        upgrade(Path(ALEMBIC_INI_TEMPLATE_PATH), Path(ALEMBIC_DIR), uri, args.revision)
+        upgrade_schema(uri, args.revision)
         revision = asyncio.run(current_revision(uri))
     print(f"Catalog schema at revision {revision}")
     if revision not in ALL_REVISIONS or ALL_REVISIONS.index(
