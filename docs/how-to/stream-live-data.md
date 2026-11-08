@@ -85,7 +85,7 @@ start = visit[update.run_uid].metadata_copy()[0].get("start", {})
 - **Use `update.sequence` to detect gaps or duplicates** within one node. It
   doesn't compare across nodes.
 - **Replay is limited.** By default (`start=0`) you first get whatever is still in
-  the streaming cache, not the whole history. Use [search](searching.md) for
+  the streaming cache, not the whole history. Use [search](search.md) for
   history.
 - **The end of a stream doesn't mean the data can be read yet.** A REST read made
   at the same moment may not see the last writes.
@@ -137,7 +137,7 @@ Add `&start=1` to replay from the first update still in the cache.
 Watching a single table gives you rows as they arrive:
 `<run>/primary/internal` holds a run's scalar values.
 
-[Glazed subscriptions](searching.md#live-events) offer the same events over
+[Glazed subscriptions](search.md#live-events) offer the same events over
 GraphQL.
 
 ## Running a server with streaming

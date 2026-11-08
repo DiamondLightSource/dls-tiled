@@ -142,7 +142,7 @@ To do something other than write HDF5, subclass `BaseCallback` and implement
 > Expect this recipe to be replaced. Don't use it for anything that depends on the
 > file being complete.
 
-This watches a visit with [streaming](streaming.md). While a scan runs, it rebuilds
+This watches a visit with [streaming](stream-live-data.md). While a scan runs, it rebuilds
 the NeXus file from Tiled every few seconds. When the stop document arrives, it
 writes the file a final time. It uses `run_documents` from
 [After the scan](#after-the-scan).

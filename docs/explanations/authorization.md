@@ -6,7 +6,7 @@ Three separate layers control access to data:
    Services use a Keycloak service account (client credentials).
 2. **Access policy.** Tiled asks [Open Policy Agent](https://www.openpolicyagent.org/)
    (OPA) what your token may see and do, using
-   [`dls_tiled.policy`](../src/dls_tiled/policy.py).
+   [`dls_tiled.policy`](https://github.com/DiamondLightSource/dls-tiled/blob/main/src/dls_tiled/policy.py).
 3. **Filesystem ACLs.** Each beamline's pod can only read that beamline's files.
    See [Architecture](architecture.md#why-one-deployment-per-beamline).
 
@@ -104,7 +104,7 @@ access_control:
 The OPA rule paths default to `tiled/user_sessions`, `tiled/user_session`,
 `tiled/modify_session` and `tiled/scopes`. They are appended to
 `authorization_provider`, so it needs its trailing `/`. The
-[project README](../README.md#dls-access-policy) lists every argument.
+[project README](https://github.com/DiamondLightSource/dls-tiled#dls-access-policy) lists every argument.
 
 ## New central authorization
 
