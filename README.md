@@ -18,6 +18,9 @@ Source          | <https://github.com/DiamondLightSource/dls-tiled>
 Docker          | `docker run ghcr.io/diamondlightsource/dls-tiled:latest`
 Releases        | <https://github.com/DiamondLightSource/dls-tiled/releases>
 
+For how to use Tiled at Diamond (searching, streaming, NeXus files, access
+control and the deployment architecture), see the [documentation](docs/README.md).
+
 ## Plugins
 
 Plugins are FastAPI routers. Enable one by listing it under `routers:` in the
