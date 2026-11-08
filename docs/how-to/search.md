@@ -78,8 +78,6 @@ All from `tiled.queries`:
 ### Recipes
 
 ```python
-from datetime import datetime
-
 from tiled.queries import Contains, Key, KeyPresent
 
 # A scan by number
@@ -90,9 +88,6 @@ visit.values().last()
 
 # The run from a blueapi task
 visit.search(Key("start.blueapi_task_id") == task_id).values().first()
-
-# Everything since a given time
-visit.search(Key("start.time") > datetime(2026, 7, 2, 9, 0).timestamp())
 
 # Finished scans using a detector, newest first
 results = (
@@ -107,6 +102,23 @@ visit.distinct("start.plan_name", counts=True)
 
 `.values().first()` raises `IndexError` if nothing matched.
 
+### Searching by time
+
+`TimeRange` from `bluesky_tiled_plugins` turns readable dates into timestamps. Any
+level of detail works, from `"2026"` to `"2026-07-02 09:00"`. Set `timezone`, or it uses
+your computer's. Search on the values it gives you:
+
+```python
+from bluesky_tiled_plugins.queries import TimeRange
+
+window = TimeRange(since="2026-07-02 09:00", until="2026-07-03", timezone="Europe/London")
+runs = visit.search(Key("start.time") >= window.since).search(
+    Key("start.time") < window.until
+)
+```
+
+Use `since` or `until` alone for an open-ended range, with just the matching search.
+
 Sort with `1` for ascending and `-1` for descending. The `DESCENDING` constant
 raises a `TypeError` in the 0.2.21 client.
 
@@ -114,10 +126,10 @@ Two things from Bluesky tutorials don't work on Diamond's server:
 
 - `visit[-1]` or `visit[42]`, which need Bluesky's catalog client. Use the recipes
   above.
-- `ScanID`, `PartialUID`, `ScanIDRange` and `TimeRange` from
-  `bluesky_tiled_plugins.queries`, which need the plugin on the server, and the
-  `dls-tiled` image doesn't include it. Use `Key("start.scan_id")` and
-  `Key("start.time")` instead.
+- Passing `ScanID`, `PartialUID`, `ScanIDRange` or `TimeRange` straight to
+  `visit.search`. Only Bluesky's catalog client knows how to apply them. On Diamond's
+  visit nodes the filter is ignored, so you get **every run back with no error**. Use
+  `Key("start.scan_id")`, and [`TimeRange` as shown above](#searching-by-time).
 
 ### Searching over HTTP
 

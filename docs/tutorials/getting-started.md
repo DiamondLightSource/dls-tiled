@@ -1,7 +1,8 @@
 # Getting started with Tiled
 
 [Tiled](https://blueskyproject.io/tiled/) is the data access service for scans
-run with Bluesky at Diamond. It stores each scan's metadata and tabular data, knows
+run with Bluesky at Diamond, and DAQ Core's main purpose for it is
+[acquisition](../explanations/service-levels.md). It stores each scan's metadata and tabular data, knows
 where its detector files are, and serves all of it over HTTP, with access
 checked against your Diamond login.
 
@@ -13,6 +14,10 @@ checked against your Diamond login.
 | Produce a NeXus file for a scan                    | [NeXus files](../how-to/create-nexus-files.md)                                               |
 | Understand who can see what                        | [Authorization](../explanations/authorization.md)                                     |
 | Understand how the service is deployed             | [Architecture](../explanations/architecture.md)                                       |
+| Know what happens during an outage                 | [Service levels and outages](../explanations/service-levels.md)        |
+| Connect from UDC or another script without a login | [Use a service account](../how-to/use-a-service-account.md)            |
+| Create a processed folder for a visit              | [Use a service account](../how-to/use-a-service-account.md#create-a-processed-folder) |
+| Ask for a custom endpoint for a beamline           | [Request a custom endpoint](../how-to/request-a-custom-endpoint.md)    |
 | Report that data can't be read                     | [Getting help](../how-to/get-help.md)                                         |
 
 ## Install and connect
