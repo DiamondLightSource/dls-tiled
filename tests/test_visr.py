@@ -167,7 +167,9 @@ def _setpoints(spec, **start):
 
 def test_setpoints_follow_axis_names_not_dimension_order():
     # Raster scan: y is the outer dimension, x the inner one.
-    spec = Line("sample_stage-y", 0, 1, 2) * Line("sample_stage-x", 0, 10, 3)
+    spec = Line("spectroscopy_stage-y", 0, 1, 2) * Line(
+        "spectroscopy_stage-x", 0, 10, 3
+    )
 
     x, y, z = _setpoints(spec)
 
@@ -181,7 +183,7 @@ def test_setpoints_of_runs_with_repr_axes_use_the_motors_list():
         "<Motor object at 0x2>", 0, 10, 3
     )
 
-    x, y, _ = _setpoints(spec, motors=["sample_stage-y", "sample_stage-x"])
+    x, y, _ = _setpoints(spec, motors=["spectroscopy_stage-y", "spectroscopy_stage-x"])
 
     assert x.tolist() == [0, 5, 10, 0, 5, 10]
     assert y.tolist() == [0, 0, 0, 1, 1, 1]
@@ -286,7 +288,9 @@ def _grid(spec, motors=None):
 
 
 def test_grid_edges_sit_halfway_between_setpoints():
-    spec = Line("sample_stage-y", 0, 2, 3) * ~Line("sample_stage-x", 0, 10, 3)
+    spec = Line("spectroscopy_stage-y", 0, 2, 3) * ~Line(
+        "spectroscopy_stage-x", 0, 10, 3
+    )
 
     x_edges, y_edges, n_total, *_ = _grid(spec)
 
@@ -300,7 +304,7 @@ def test_grid_of_runs_with_repr_axes_uses_the_motors_list():
         "<Motor object at 0x2>", 0, 10, 3
     )
 
-    x_edges, y_edges, *_ = _grid(spec, ["sample_stage-y", "sample_stage-x"])
+    x_edges, y_edges, *_ = _grid(spec, ["spectroscopy_stage-y", "spectroscopy_stage-x"])
 
     assert len(x_edges) == 4 and len(y_edges) == 4
 
@@ -733,11 +737,14 @@ def test_binned_etag_changes_when_the_image_does(client):
 @pytest.mark.parametrize(
     ("stored", "name"),
     [
-        ("sample_stage-x", "sample_stage-x"),
-        ('Motor(name="sample_stage-x")', "sample_stage-x"),
-        ("Motor(name='sample_stage-y')", "sample_stage-y"),
-        ('Motor(device_name="stage", name="sample_stage-x")', "sample_stage-x"),
-        ('Motor(prefix="BL01:", name="sample_stage-x")', "sample_stage-x"),
+        ("spectroscopy_stage-x", "spectroscopy_stage-x"),
+        ('Motor(name="spectroscopy_stage-x")', "spectroscopy_stage-x"),
+        ("Motor(name='spectroscopy_stage-y')", "spectroscopy_stage-y"),
+        (
+            'Motor(device_name="stage", name="spectroscopy_stage-x")',
+            "spectroscopy_stage-x",
+        ),
+        ('Motor(prefix="BL01:", name="spectroscopy_stage-x")', "spectroscopy_stage-x"),
         ("<ophyd_async.epics.motor.Motor object at 0x7f797c058590>", None),
     ],
 )
@@ -747,8 +754,8 @@ def test_axis_name_reads_the_name_out_of_the_forms_runs_store(stored, name):
 
 def test_setpoints_of_runs_with_named_reprs_need_no_motors_list():
     # recent runs store Motor(name=...) and fly scans have no motors list
-    spec = Line('Motor(name="sample_stage-y")', 0, 1, 2) * Line(
-        'Motor(name="sample_stage-x")', 0, 10, 3
+    spec = Line('Motor(name="spectroscopy_stage-y")', 0, 1, 2) * Line(
+        'Motor(name="spectroscopy_stage-x")', 0, 10, 3
     )
 
     x, y, _ = _setpoints(spec)
@@ -758,8 +765,8 @@ def test_setpoints_of_runs_with_named_reprs_need_no_motors_list():
 
 
 def test_grid_of_runs_with_named_reprs_needs_no_motors_list():
-    spec = Line('Motor(name="sample_stage-y")', 0, 2, 3) * ~Line(
-        'Motor(name="sample_stage-x")', 0, 10, 3
+    spec = Line('Motor(name="spectroscopy_stage-y")', 0, 2, 3) * ~Line(
+        'Motor(name="spectroscopy_stage-x")', 0, 10, 3
     )
 
     x_edges, y_edges, n_total, *_ = _grid(spec)
@@ -906,7 +913,10 @@ def test_place_on_grid_without_points_is_the_bare_grid():
 
 @pytest.mark.parametrize(
     "motors",
-    [["sample_stage-y", "sample_stage-x"], ["sample_stage-x", "sample_stage-y"]],
+    [
+        ["spectroscopy_stage-y", "spectroscopy_stage-x"],
+        ["spectroscopy_stage-x", "spectroscopy_stage-y"],
+    ],
 )
 def test_binned_lets_the_points_decide_x_and_y_when_only_the_motors_list_names_them(
     client, motors
@@ -990,7 +1000,11 @@ def write_points(
     target = primary if where == "primary" else primary.create_container(where)
     names = {"X": "X", "Y": "Y", "Z": "Z"}
     if where != "primary" or channels == "named":
-        names = {"X": "sample_stage-x", "Y": "sample_stage-y", "Z": "sample_stage-z"}
+        names = {
+            "X": "spectroscopy_stage-x",
+            "Y": "spectroscopy_stage-y",
+            "Z": "spectroscopy_stage-z",
+        }
     target.write_array(numpy.asarray(x, dtype=float), key=names["X"])
     target.write_array(numpy.asarray(y, dtype=float), key=names["Y"])
     if z is not None:
@@ -1121,7 +1135,8 @@ def test_binned_swapping_the_dimension_indices_transposes_the_image(client):
 
 @pytest.mark.parametrize("where", ["internal", "named"])
 def test_binned_finds_positions_wherever_the_run_stores_them(client, where):
-    # older fly scans: primary/internal/sample_stage-x; others: primary/sample_stage-x
+    # older fly scans: primary/internal/spectroscopy_stage-x
+    # others: primary/spectroscopy_stage-x
     x, y = [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]
     if where == "internal":
         write_points(client, where, x, y, where="internal")
@@ -1284,8 +1299,8 @@ def test_binned_bins_a_step_scans_diodes_from_its_event_table(client):
     primary.write_dataframe(
         pandas.DataFrame(
             {
-                "sample_stage-x": SQUARE_X,
-                "sample_stage-y": SQUARE_Y,
+                "spectroscopy_stage-x": SQUARE_X,
+                "spectroscopy_stage-y": SQUARE_Y,
                 **{f"spectroscopy_diodes-{c}": v for c, v in DIODES.items()},
             }
         ),
