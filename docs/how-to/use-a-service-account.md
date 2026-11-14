@@ -17,14 +17,17 @@ This example uses a client called `p46UDC`, with `beamline` set to `p46` and the
 audience `tiled`. Keep the secret out of your code and pass it in through the
 environment, for example from a `.env` file that isn't committed.
 
+The deployed Tiled is version 0.2.18, so install the matching client, which uses
+`httpx`:
+
+```sh
+pip install "tiled[client]==0.2.18" httpx
+```
+
 ```python
 import os
 
-try:
-    import httpx2 as httpx  # the Tiled client uses httpx2 from version 0.2.21
-except ImportError:
-    import httpx
-
+import httpx
 from tiled.client import from_uri
 from tiled.queries import Key
 
@@ -54,6 +57,9 @@ visit = client["p46/cm44194/cm44194-1"]
 finished = visit.search(Key("stop.exit_status") == "success")
 print(len(finished))
 ```
+
+From version 0.2.21 the Tiled client uses `httpx2`. When the deployment moves to it,
+change the import to `import httpx2 as httpx`.
 
 From here, everything in [Searching](search.md) works as it does for a person.
 

@@ -1,12 +1,10 @@
 # Architectural Decision Records
 
-Architectural decisions are made throughout a project's lifetime. As a way of keeping track of these decisions, we record these decisions in Architecture Decision Records (ADRs) listed below.
+Decisions that affect Tiled at Diamond are recorded in the
+[Diamond Developer Guide](https://dev-guide.diamond.ac.uk/adrs/docs/records/0024/):
 
-```{toctree}
-:glob: true
-:maxdepth: 1
-
-decisions/*
-```
-
-For more information on ADRs see this [blog by Michael Nygard](http://thinkrelevance.com/blog/2011/11/15/documenting-architecture-decisions).
+| ADR | Title | Status |
+| --- | ----- | ------ |
+| [0024](https://dev-guide.diamond.ac.uk/adrs/docs/records/0024/) | Tiled Data Retention and DataCat Metadata Schema | Proposed |
+| [0027](https://dev-guide.diamond.ac.uk/adrs/docs/records/0027/) | Nexus File Creation | Proposed |
+| [0028](https://gitlab.diamond.ac.uk/sscc-docs/architectural-decision-records/-/merge_requests/21/diffs) | "Tiled for everything" Metadata model | In review (merge request) |
