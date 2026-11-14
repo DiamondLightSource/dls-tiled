@@ -16,7 +16,14 @@ What            | Where
 :---:           | :---:
 Source          | <https://github.com/DiamondLightSource/dls-tiled>
 Docker          | `docker run ghcr.io/diamondlightsource/dls-tiled:latest`
+Documentation   | <https://diamondlightsource.github.io/dls-tiled>
 Releases        | <https://github.com/DiamondLightSource/dls-tiled/releases>
+
+<!-- README only content. Anything below this line won't be included in index.md -->
+
+For how to use Tiled at Diamond (searching, streaming, NeXus files, access
+control and the deployment architecture), see the
+[documentation](https://diamondlightsource.github.io/dls-tiled).
 
 ## Plugins
 

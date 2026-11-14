@@ -21,11 +21,16 @@ requires-python = ">=3.11"
 
 [dependency-groups]
 dev = [
+    "myst-parser",
     "pre-commit",
+    "pydata-sphinx-theme>=0.12",
     "pyright",
     "pytest",
     "pytest-cov",
     "ruff",
+    "sphinx-autobuild",
+    "sphinx-copybutton",
+    "sphinx-design",
     "tox-uv",
     "types-mock",
 ]
@@ -74,7 +79,7 @@ source = ["src", "**/site-packages/"]
 [tool.tox]
 skipsdist = true
 # envs to runs automatically with tox -p
-env_list = ["pre-commit", "type-checking", "tests"]
+env_list = ["pre-commit", "type-checking", "tests", "docs"]
 
 [tool.tox.env_run_base]
 # Pass all environment variables to the test environments
@@ -117,6 +122,37 @@ commands = [
         "term",
         "--cov-report",
         "xml:cov.xml",
+        { replace = "posargs", default = [
+        ], extend = true },
+    ],
+]
+
+[tool.tox.env.docs]
+description = "Run docs build with clean environment"
+commands = [
+    [
+        "sphinx-build",
+        "--fresh-env",
+        "--show-traceback",
+        "--fail-on-warning",
+        "--keep-going",
+        "docs",
+        "build/html",
+        { replace = "posargs", default = [
+        ], extend = true },
+    ],
+]
+
+[tool.tox.env.docs-autobuild]
+description = "Run docs with autobuild on change"
+commands = [
+    [
+        "sphinx-autobuild",
+        "--show-traceback",
+        "--watch",
+        "README.md",
+        "docs",
+        "build/html",
         { replace = "posargs", default = [
         ], extend = true },
     ],
