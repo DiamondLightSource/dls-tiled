@@ -5,7 +5,7 @@
 
 services:
   postgres:
-    image: docker.io/postgres:18
+    image: docker.io/postgres:19
     environment:
       - POSTGRES_PASSWORD=postgres
     ports:
