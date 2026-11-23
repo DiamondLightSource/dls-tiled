@@ -196,7 +196,7 @@ _AXIS_LETTERS = ("x", "y", "z")
 
 
 def _axis_letter(name: object) -> str | None:
-    """Return "x", "y" or "z" if the axis name ends in one (e.g. "sample_stage-x")."""
+    """Return "x", "y" or "z" if the name ends in one (e.g. "spectroscopy_stage-x")."""
     if not isinstance(name, str):
         return None
     letter = re.split(r"[-_.]", name.lower())[-1]
@@ -211,7 +211,7 @@ def _axis_name(axis: object) -> str | None:
     """The device name of a spec axis, or None if the spec doesn't carry one.
 
     A spec axis is whatever the plan passed in: a plain name, an ophyd-async
-    repr that carries the name (``Motor(name="sample_stage-x")``), or, in older
+    repr that carries the name (``Motor(name="spectroscopy_stage-x")``), or, in older
     runs, an object repr with no name (``<... Motor object at 0x7f...>``).
     """
     if not isinstance(axis, str):
@@ -486,11 +486,11 @@ async def get_setpoints(root, uid):
 
 async def _fetch_readback_x(root, uid) -> tuple[H5Dataset | numpy.ndarray, ScanType]:
     try:
-        x = await get_data(root, [uid, "primary", "internal", "sample_stage-x"])
+        x = await get_data(root, [uid, "primary", "internal", "spectroscopy_stage-x"])
         scan_type = ScanType.FlyScan
     except NoEntry:
         try:
-            x = await get_data(root, [uid, "primary", "sample_stage-x"])
+            x = await get_data(root, [uid, "primary", "spectroscopy_stage-x"])
             scan_type = ScanType.FlyScan
         except NoEntry:
             x = await get_data(root, [uid, "primary", "X"])
@@ -502,13 +502,17 @@ async def _fetch_readback_x(root, uid) -> tuple[H5Dataset | numpy.ndarray, ScanT
 async def _fetch_readback_yz(root, uid, scan_type, x_shape):
     if scan_type == ScanType.FlyScan:
         try:
-            y = await get_data(root, [uid, "primary", "internal", "sample_stage-y"])
+            y = await get_data(
+                root, [uid, "primary", "internal", "spectroscopy_stage-y"]
+            )
         except NoEntry:
-            y = await fill_data(root, [uid, "primary", "sample_stage-y"], x_shape)
+            y = await fill_data(root, [uid, "primary", "spectroscopy_stage-y"], x_shape)
         try:
-            z = await get_data(root, [uid, "primary", "internal", "sample_stage-z"])
+            z = await get_data(
+                root, [uid, "primary", "internal", "spectroscopy_stage-z"]
+            )
         except NoEntry:
-            z = await fill_data(root, [uid, "primary", "sample_stage-z"], x_shape)
+            z = await fill_data(root, [uid, "primary", "spectroscopy_stage-z"], x_shape)
     else:
         y = await fill_data(root, [uid, "primary", "Y"], x_shape)
         z = await fill_data(root, [uid, "primary", "Z"], x_shape)
